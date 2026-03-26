@@ -127,7 +127,7 @@ function normalizeSessionKeyStrategy(value: unknown): SessionKeyStrategy {
 }
 
 function hasAgentScope(sessionKey: string): boolean {
-  return /^agent:[a-z0-9_-]+:.+/i.test(sessionKey.trim());
+  return /^agent:[a-z0-9_-]+:.+/.test(sessionKey.trim());
 }
 
 export function resolveSessionKey(input: {

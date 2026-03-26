@@ -71,6 +71,17 @@ describe("resolveSessionKey", () => {
     expect(key).toBe("paperclip:run:run-456");
   });
 
+  it("returns legacy run key when agentId is 'main'", () => {
+    const key = resolveSessionKey({
+      strategy: "run",
+      configuredSessionKey: null,
+      runId,
+      issueId: null,
+      agentId: "main",
+    });
+    expect(key).toBe("paperclip:run:run-456");
+  });
+
   it("returns agent-scoped fallback when strategy is fixed with unscoped key", () => {
     const key = resolveSessionKey({
       strategy: "fixed",
