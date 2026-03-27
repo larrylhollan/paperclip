@@ -133,9 +133,8 @@ function normalizeSessionKeyStrategy(value: unknown): SessionKeyStrategy {
   return "issue";
 }
 
-function prefixSessionKeyForAgent(sessionKey: string, agentId: string | null): string {
-  if (!agentId || sessionKey.startsWith("agent:")) return sessionKey;
-  return `agent:${agentId}:${sessionKey}`;
+function hasAgentScope(sessionKey: string): boolean {
+  return /^agent:[a-z0-9_-]+:.+/.test(sessionKey.trim());
 }
 
 export function resolveSessionKey(input: {
@@ -146,13 +145,17 @@ export function resolveSessionKey(input: {
   issueId: string | null;
 }): string {
   const fallback = input.configuredSessionKey ?? "paperclip";
+  let base: string;
   if (input.strategy === "run") {
-    return prefixSessionKeyForAgent(`paperclip:run:${input.runId}`, input.agentId);
+    base = `paperclip:run:${input.runId}`;
+  } else if (input.strategy === "issue" && input.issueId) {
+    base = `paperclip:issue:${input.issueId}`;
+  } else {
+    base = fallback;
   }
-  if (input.strategy === "issue" && input.issueId) {
-    return prefixSessionKeyForAgent(`paperclip:issue:${input.issueId}`, input.agentId);
-  }
-  return prefixSessionKeyForAgent(fallback, input.agentId);
+  if (!input.agentId || input.agentId === "main") return base;
+  if (hasAgentScope(base)) return base;
+  return `agent:${input.agentId}:${base}`;
 }
 
 function isLoopbackHost(hostname: string): boolean {
@@ -362,8 +365,10 @@ function buildWakeText(
   payload: WakePayload,
   paperclipEnv: Record<string, string>,
   structuredWakePrompt: string,
+  claimedApiKeyPathOverride?: string | null,
 ): string {
-  const claimedApiKeyPath = "~/.openclaw/workspace/paperclip-claimed-api-key.json";
+  const claimedApiKeyPath =
+    nonEmpty(claimedApiKeyPathOverride) ?? "~/.openclaw/workspace/paperclip-claimed-api-key.json";
   const orderedKeys = [
     "PAPERCLIP_RUN_ID",
     "PAPERCLIP_AGENT_ID",
@@ -1103,20 +1108,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload);
   const structuredWakePrompt = renderPaperclipWakePrompt(ctx.context.paperclipWake);
   const structuredWakeJson = stringifyPaperclipWakePayload(ctx.context.paperclipWake);
+  const claimedApiKeyPath = nonEmpty(ctx.config.claimedApiKeyPath);
   const wakeText = buildWakeText(
     wakePayload,
     paperclipEnv,
     structuredWakeJson
       ? joinWakePayloadSections(structuredWakePrompt, structuredWakeJson)
       : structuredWakePrompt,
+    claimedApiKeyPath,
   );
 
   const sessionKeyStrategy = normalizeSessionKeyStrategy(ctx.config.sessionKeyStrategy);
   const configuredSessionKey = nonEmpty(ctx.config.sessionKey);
+  const configuredAgentId = nonEmpty(ctx.config.agentId);
   const sessionKey = resolveSessionKey({
     strategy: sessionKeyStrategy,
     configuredSessionKey,
-    agentId: nonEmpty(ctx.config.agentId),
+    agentId: configuredAgentId ?? nonEmpty(wakePayload.agentId),
     runId: ctx.runId,
     issueId: wakePayload.issueId,
   });
@@ -1134,7 +1142,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   delete agentParams.text;
   agentParams.paperclip = paperclipPayload;
 
-  const configuredAgentId = nonEmpty(ctx.config.agentId);
   if (configuredAgentId && !nonEmpty(agentParams.agentId)) {
     agentParams.agentId = configuredAgentId;
   }

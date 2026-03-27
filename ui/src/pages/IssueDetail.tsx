@@ -67,10 +67,15 @@ import { ScrollToBottom } from "../components/ScrollToBottom";
 import { StatusIcon } from "../components/StatusIcon";
 import { PriorityIcon } from "../components/PriorityIcon";
 import { Identity } from "../components/Identity";
+import { IssueHeaderActions } from "../components/IssueHeaderActions";
 import { PluginSlotMount, PluginSlotOutlet, usePluginSlots } from "@/plugins/slots";
 import { PluginLauncherOutlet } from "@/plugins/launchers";
 import { Separator } from "@/components/ui/separator";
-import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -85,17 +90,18 @@ import {
   Archive,
   ArrowLeft,
   Check,
+  ChevronDown,
   ChevronRight,
-  Copy,
   EyeOff,
   Hexagon,
+  ListTree,
+  Loader2,
   MessageSquare,
   MoreHorizontal,
   MoreVertical,
   Paperclip,
   Plus,
   Repeat,
-  SlidersHorizontal,
   Trash2,
 } from "lucide-react";
 import {
@@ -861,14 +867,23 @@ export function IssueDetail() {
   const { pushToast } = useToastActions();
   const { isMobile } = useSidebar();
   const [moreOpen, setMoreOpen] = useState(false);
+  const [jitDialogOpen, setJitDialogOpen] = useState(false);
+  const [jitTarget, setJitTarget] = useState("work.int");
+  const [jitPrincipal, setJitPrincipal] = useState("");
+  const [jitTtl, setJitTtl] = useState("");
+  const [jitShareTmux, setJitShareTmux] = useState(false);
   const [copied, setCopied] = useState(false);
   const [mobilePropsOpen, setMobilePropsOpen] = useState(false);
+  const [mobileActionsOpen, setMobileActionsOpen] = useState(false);
   const [detailTab, setDetailTab] = useState("chat");
   const [pendingApprovalAction, setPendingApprovalAction] = useState<{
     approvalId: string;
     action: "approve" | "reject";
   } | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [secondaryOpen, setSecondaryOpen] = useState({
+    approvals: false,
+  });
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [attachmentDragActive, setAttachmentDragActive] = useState(false);
   const [galleryOpen, setGalleryOpen] = useState(false);
@@ -1399,6 +1414,25 @@ export function IssueDetail() {
       if (variables.reopen) {
         invalidateIssueCollections();
       }
+    },
+  });
+
+  const jitTargetsQuery = useQuery({
+    queryKey: ["jit-targets"],
+    queryFn: () => issuesApi.listJitTargets(),
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const requestJitSshToken = useMutation({
+    mutationFn: (opts: { target: string; principal?: string; ttlMinutes?: number; shareTmux?: boolean }) =>
+      issuesApi.requestJitSshToken(issueId!, opts),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(issueId!) });
+      pushToast({ title: "SSH token provisioned", body: "A JIT SSH credential has been attached to this issue." });
+      setJitDialogOpen(false);
+    },
+    onError: (err: Error & { status?: number; body?: { error?: string } }) => {
+      pushToast({ title: "SSH token failed", body: err.body?.error ?? err.message, tone: "error" });
     },
   });
 
@@ -2261,72 +2295,142 @@ export function IssueDetail() {
           )}
 
           {!(isMobile && isFromInbox) && (
-            <div className="ml-auto flex items-center gap-0.5 md:hidden shrink-0">
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                onClick={copyIssueToClipboard}
-                title="Copy issue as markdown"
-              >
-                {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                onClick={() => setMobilePropsOpen(true)}
-                title="Properties"
-              >
-                <SlidersHorizontal className="h-4 w-4" />
-              </Button>
-            </div>
+            <IssueHeaderActions
+              copied={copied}
+              panelVisible={panelVisible}
+              moreOpen={moreOpen}
+              onMoreOpenChange={setMoreOpen}
+              mobileActionsOpen={mobileActionsOpen}
+              onMobileActionsOpenChange={setMobileActionsOpen}
+              onCopy={copyIssueToClipboard}
+              onShowProperties={() => setMobilePropsOpen(true)}
+              onShowPanel={() => setPanelVisible(true)}
+              onOpenJitDialog={() => setJitDialogOpen(true)}
+              onHideIssue={() => {
+                updateIssue.mutate(
+                  { hiddenAt: new Date().toISOString() },
+                  { onSuccess: () => navigate("/issues/all") },
+                );
+              }}
+            />
           )}
 
-          <div className="hidden md:flex items-center md:ml-auto shrink-0">
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              onClick={copyIssueToClipboard}
-              title="Copy issue as markdown"
-            >
-              {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              className={cn(
-                "shrink-0 transition-opacity duration-200",
-                panelVisible ? "opacity-0 pointer-events-none w-0 overflow-hidden" : "opacity-100",
-              )}
-              onClick={() => setPanelVisible(true)}
-              title="Show properties"
-            >
-              <SlidersHorizontal className="h-4 w-4" />
-            </Button>
+            {/* ── JIT SSH Token Request Dialog ────────────────── */}
+            <Dialog open={jitDialogOpen} onOpenChange={(open) => {
+              setJitDialogOpen(open);
+              if (!open) requestJitSshToken.reset();
+            }}>
+              <DialogContent className="sm:max-w-md">
+                <DialogHeader>
+                  <DialogTitle>Request JIT SSH Access</DialogTitle>
+                  <DialogDescription>
+                    Provision a short-lived SSH certificate for this issue&rsquo;s agent.
+                  </DialogDescription>
+                </DialogHeader>
 
-            <Popover open={moreOpen} onOpenChange={setMoreOpen}>
-              <PopoverTrigger asChild>
-                <Button variant="ghost" size="icon-xs" className="shrink-0">
-                  <MoreHorizontal className="h-4 w-4" />
-                </Button>
-              </PopoverTrigger>
-            <PopoverContent className="w-44 p-1" align="end">
-              <button
-                className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-destructive"
-                onClick={() => {
-                  updateIssue.mutate(
-                    { hiddenAt: new Date().toISOString() },
-                    { onSuccess: () => navigate("/issues/all") },
-                  );
-                  setMoreOpen(false);
-                }}
-              >
-                <EyeOff className="h-3 w-3" />
-                Hide this Issue
-              </button>
-            </PopoverContent>
-            </Popover>
+                <form
+                  className="grid gap-4 py-2"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const opts: { target: string; principal?: string; ttlMinutes?: number; shareTmux?: boolean } = {
+                      target: jitTarget,
+                    };
+                    if (jitPrincipal) opts.principal = jitPrincipal;
+                    const ttlNum = parseInt(jitTtl, 10);
+                    if (jitTtl && !isNaN(ttlNum) && ttlNum > 0) opts.ttlMinutes = ttlNum;
+                    if (jitShareTmux) opts.shareTmux = true;
+                    requestJitSshToken.mutate(opts);
+                  }}
+                >
+                  {/* Target machine */}
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="jit-target">Target machine</Label>
+                    <Select value={jitTarget} onValueChange={setJitTarget}>
+                      <SelectTrigger id="jit-target">
+                        <SelectValue placeholder="Select machine" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {(jitTargetsQuery.data ?? []).map((t) => (
+                          <SelectItem key={t.name} value={t.name}>
+                            {t.label} ({t.name})
+                          </SelectItem>
+                        ))}
+                        {!jitTargetsQuery.data?.length && (
+                          <SelectItem value="work.int" disabled>
+                            Loading…
+                          </SelectItem>
+                        )}
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  {/* Principal / permission */}
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="jit-principal">Permission level</Label>
+                    <Select value={jitPrincipal} onValueChange={setJitPrincipal}>
+                      <SelectTrigger id="jit-principal">
+                        <SelectValue placeholder={`Default (${
+                          jitTargetsQuery.data?.find((t) => t.name === jitTarget)?.defaultPrincipal ?? "agent"
+                        })`} />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="agent-read">agent-read (read-only)</SelectItem>
+                        <SelectItem value="agent-web">agent-web (normal dev)</SelectItem>
+                        <SelectItem value="agent-admin">agent-admin (sudo)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  {/* TTL */}
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="jit-ttl">TTL (minutes)</Label>
+                    <Input
+                      id="jit-ttl"
+                      type="number"
+                      min={1}
+                      max={1440}
+                      placeholder={String(
+                        jitTargetsQuery.data?.find((t) => t.name === jitTarget)?.defaultTtlMinutes ?? 60
+                      )}
+                      value={jitTtl}
+                      onChange={(e) => setJitTtl(e.target.value)}
+                    />
+                  </div>
+
+                  {/* Share tmux */}
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      id="jit-tmux"
+                      checked={jitShareTmux}
+                      onCheckedChange={(v) => setJitShareTmux(v === true)}
+                    />
+                    <Label htmlFor="jit-tmux" className="text-sm font-normal">
+                      Share tmux session with agent
+                    </Label>
+                  </div>
+
+                  {/* Error display */}
+                  {requestJitSshToken.isError && (
+                    <p className="text-sm text-destructive">
+                      {(requestJitSshToken.error as Error & { body?: { error?: string } }).body?.error ??
+                        requestJitSshToken.error.message}
+                    </p>
+                  )}
+
+                  <DialogFooter>
+                    <Button
+                      type="submit"
+                      disabled={requestJitSshToken.isPending}
+                      className="gap-2"
+                    >
+                      {requestJitSshToken.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+                      {requestJitSshToken.isPending ? "Provisioning…" : "Provision Token"}
+                    </Button>
+                  </DialogFooter>
+                </form>
+              </DialogContent>
+            </Dialog>
           </div>
-        </div>
 
         <InlineEditor
           value={issue.title}

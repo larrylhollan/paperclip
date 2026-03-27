@@ -1,0 +1,103 @@
+/**
+ * Server-side allowlisted target registry for JIT SSH token issuance.
+ *
+ * Each entry maps a short machine name to its issuer base URL and default
+ * options. The registry is populated from the JIT_TARGET_REGISTRY env var
+ * (JSON) with a built-in fallback for the three canonical targets.
+ */
+
+import { z } from "zod";
+
+// ── Schema for a single target entry ────────────────────────────────
+export const jitTargetEntrySchema = z.object({
+  /** Human-readable label shown in the UI / comments. */
+  label: z.string().min(1),
+  /** Base URL of the issuer service (e.g. agent-access instance). */
+  issuerBaseUrl: z.string().url(),
+  /** Default principal to request when none is specified. */
+  defaultPrincipal: z.string().min(1).default("agent"),
+  /** Default TTL in minutes. */
+  defaultTtlMinutes: z.number().int().positive().default(60),
+});
+
+export type JitTargetEntry = z.infer<typeof jitTargetEntrySchema>;
+
+export const jitTargetRegistrySchema = z.record(z.string().min(1), jitTargetEntrySchema);
+
+export type JitTargetRegistry = z.infer<typeof jitTargetRegistrySchema>;
+
+// ── Issuance request payload (sent by the client) ───────────────────
+export const jitIssuanceRequestSchema = z.object({
+  /** Which registered machine to target (e.g. "work.int"). */
+  target: z.string().min(1),
+  /** SSH principal / permission set. Falls back to target default. */
+  principal: z.string().min(1).optional(),
+  /** Certificate TTL in minutes. Falls back to target default. */
+  ttlMinutes: z.number().int().positive().max(1440).optional(),
+  /** Whether to share a tmux session with the agent. */
+  shareTmux: z.boolean().optional(),
+  /** Arbitrary per-target options forwarded to the issuer. */
+  options: z.record(z.unknown()).optional(),
+});
+
+export type JitIssuanceRequest = z.infer<typeof jitIssuanceRequestSchema>;
+
+// ── Registry loading ────────────────────────────────────────────────
+
+function buildFallbackRegistry(): JitTargetRegistry {
+  const baseUrl = process.env.AGENT_ACCESS_BASE_URL;
+  if (!baseUrl) return {};
+  return {
+    "work.int": {
+      label: "Work",
+      issuerBaseUrl: baseUrl,
+      defaultPrincipal: "agent",
+      defaultTtlMinutes: 60,
+    },
+    "pc.int": {
+      label: "Paperclip",
+      issuerBaseUrl: baseUrl,
+      defaultPrincipal: "agent",
+      defaultTtlMinutes: 60,
+    },
+    "arch.int": {
+      label: "Arch",
+      issuerBaseUrl: baseUrl,
+      defaultPrincipal: "agent",
+      defaultTtlMinutes: 60,
+    },
+  };
+}
+
+let cachedRegistry: JitTargetRegistry | null = null;
+
+export function loadJitTargetRegistry(): JitTargetRegistry {
+  if (cachedRegistry) return cachedRegistry;
+
+  const envJson = process.env.JIT_TARGET_REGISTRY;
+  if (envJson) {
+    try {
+      cachedRegistry = jitTargetRegistrySchema.parse(JSON.parse(envJson));
+    } catch {
+      throw new Error("Invalid JIT_TARGET_REGISTRY env var – must be valid JSON matching the target schema");
+    }
+  } else {
+    cachedRegistry = buildFallbackRegistry();
+  }
+  return cachedRegistry;
+}
+
+/** Look up a single target. Returns undefined when the target is not allowlisted. */
+export function getJitTarget(targetName: string): JitTargetEntry | undefined {
+  return loadJitTargetRegistry()[targetName];
+}
+
+/** Return the list of allowlisted target names. */
+export function listJitTargets(): string[] {
+  return Object.keys(loadJitTargetRegistry());
+}
+
+/** Clear cached registry (useful for tests). */
+export function resetJitTargetRegistryCache(): void {
+  cachedRegistry = null;
+}

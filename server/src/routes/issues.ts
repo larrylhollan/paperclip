@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
+import { readFileSync } from "node:fs";
 import multer from "multer";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
-import { issueExecutionDecisions } from "@paperclipai/db";
+import { issueExecutionDecisions, approvals as approvalsTable } from "@paperclipai/db";
+import { eq as drizzleEq } from "drizzle-orm";
 import {
   addIssueCommentSchema,
   createIssueAttachmentMetadataSchema,
@@ -32,6 +34,7 @@ import { validate } from "../middleware/validate.js";
 import {
   accessService,
   agentService,
+  approvalService,
   executionWorkspaceService,
   feedbackService,
   goalService,
@@ -65,6 +68,10 @@ import {
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../services/issue-execution-policy.js";
+import { getJitTarget, listJitTargets, loadJitTargetRegistry, jitIssuanceRequestSchema } from "../jit-target-registry.js";
+import { createIssuanceId, storeIssuance, resolveIssuance } from "../jit-issuance-store.js";
+import { computeJitApprovalHash } from "../jit-approval-hash.js";
+import { generateApprovalTicket } from "../jit-approval-ticket.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -280,6 +287,153 @@ function buildExecutionStageWakeup(input: {
   }
 
   return null;
+type RawJitSignerPayload = {
+  fetchUrl?: string;
+  fetch_url?: string;
+  principal?: string;
+  ttlMinutes?: number;
+  ttl_minutes?: number;
+  targetHost?: string;
+  target_host?: string;
+  sshHost?: string;
+  ssh_host?: string;
+  sshUser?: string;
+  ssh_user?: string;
+  certId?: string;
+  cert_id?: string;
+  issuedAt?: string;
+  issued_at?: string;
+  expiresAt?: string;
+  expires_at?: string;
+  issuedOptions?: Record<string, unknown>;
+  issued_options?: Record<string, unknown>;
+  options?: Record<string, unknown>;
+};
+
+function readAgentAccessBearerToken(): string | undefined {
+  const inlineToken = process.env.AGENT_ACCESS_BEARER_TOKEN?.trim();
+  if (inlineToken) return inlineToken;
+
+  const tokenFile = process.env.AGENT_ACCESS_BEARER_TOKEN_FILE?.trim();
+  if (!tokenFile) return undefined;
+
+  try {
+    const fileToken = readFileSync(tokenFile, "utf8").trim();
+    return fileToken || undefined;
+  } catch (err) {
+    logger.warn({ err, tokenFile }, "failed to read agent-access bearer token file");
+    return undefined;
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+function omitUndefined<T extends Record<string, unknown>>(value: T): T {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
+}
+
+function normalizeJitSignerPayload(
+  rawTokenPayload: RawJitSignerPayload,
+  issuanceReq: z.infer<typeof jitIssuanceRequestSchema>,
+  targetLabel: string,
+) {
+  const fetchUrl = rawTokenPayload.fetch_url ?? rawTokenPayload.fetchUrl;
+  const ttlMinutes = rawTokenPayload.ttl_minutes ?? rawTokenPayload.ttlMinutes;
+  const sshHost =
+    rawTokenPayload.ssh_host ??
+    rawTokenPayload.sshHost ??
+    rawTokenPayload.target_host ??
+    rawTokenPayload.targetHost;
+  const sshUser = rawTokenPayload.ssh_user ?? rawTokenPayload.sshUser;
+  const certId = rawTokenPayload.cert_id ?? rawTokenPayload.certId;
+  const issuedAt = rawTokenPayload.issued_at ?? rawTokenPayload.issuedAt;
+  const expiresAt = rawTokenPayload.expires_at ?? rawTokenPayload.expiresAt;
+  const signerIssuedOptions =
+    asRecord(rawTokenPayload.issued_options) ?? asRecord(rawTokenPayload.issuedOptions) ?? asRecord(rawTokenPayload.options);
+  const requestedIssuedOptions = omitUndefined({
+    ...(issuanceReq.options ?? {}),
+    share_tmux: issuanceReq.shareTmux ?? undefined,
+  });
+  const issuedOptions =
+    signerIssuedOptions ?? (Object.keys(requestedIssuedOptions).length > 0 ? requestedIssuedOptions : undefined);
+
+  return { fetchUrl, ttlMinutes, sshHost, sshUser, certId, issuedAt, expiresAt, issuedOptions, targetLabel };
+}
+
+function buildJitIssueCommentPayload(
+  rawTokenPayload: RawJitSignerPayload,
+  issuanceReq: z.infer<typeof jitIssuanceRequestSchema>,
+  targetLabel: string,
+  issuanceId: string,
+) {
+  const n = normalizeJitSignerPayload(rawTokenPayload, issuanceReq, targetLabel);
+
+  return omitUndefined({
+    type: "jit-ssh-token",
+    schema_version: 3,
+    target: issuanceReq.target,
+    target_label: targetLabel,
+    issuance_id: issuanceId,
+    principal: rawTokenPayload.principal ?? issuanceReq.principal,
+    ttl_minutes: n.ttlMinutes,
+    ssh_host: n.sshHost,
+    ssh_user: n.sshUser,
+    cert_id: n.certId,
+    issued_at: n.issuedAt,
+    expires_at: n.expiresAt,
+    issued_options: n.issuedOptions,
+    // Legacy aliases retained for older agents / helpers while the canonical
+    // snake_case schema rolls out.
+    targetLabel: targetLabel,
+    issuanceId,
+    ttlMinutes: n.ttlMinutes,
+    targetHost: n.sshHost,
+    sshHost: n.sshHost,
+    sshUser: n.sshUser,
+    certId: n.certId,
+    issuedAt: n.issuedAt,
+    expiresAt: n.expiresAt,
+    issuedOptions: n.issuedOptions,
+  });
+}
+
+function buildJitHttpResponsePayload(
+  rawTokenPayload: RawJitSignerPayload,
+  issuanceReq: z.infer<typeof jitIssuanceRequestSchema>,
+  targetLabel: string,
+) {
+  const n = normalizeJitSignerPayload(rawTokenPayload, issuanceReq, targetLabel);
+
+  return omitUndefined({
+    type: "jit-ssh-token",
+    schema_version: 3,
+    target: issuanceReq.target,
+    target_label: targetLabel,
+    fetch_url: n.fetchUrl,
+    principal: rawTokenPayload.principal ?? issuanceReq.principal,
+    ttl_minutes: n.ttlMinutes,
+    ssh_host: n.sshHost,
+    ssh_user: n.sshUser,
+    cert_id: n.certId,
+    issued_at: n.issuedAt,
+    expires_at: n.expiresAt,
+    issued_options: n.issuedOptions,
+    // Legacy aliases retained for older agents / helpers while the canonical
+    // snake_case schema rolls out.
+    targetLabel: targetLabel,
+    fetchUrl: n.fetchUrl,
+    ttlMinutes: n.ttlMinutes,
+    targetHost: n.sshHost,
+    sshHost: n.sshHost,
+    sshUser: n.sshUser,
+    certId: n.certId,
+    issuedAt: n.issuedAt,
+    expiresAt: n.expiresAt,
+    issuedOptions: n.issuedOptions,
+  });
 }
 
 export function issueRoutes(
@@ -306,6 +460,7 @@ export function issueRoutes(
   const projectsSvc = projectService(db);
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
+  const approvalsSvc = approvalService(db);
   const executionWorkspacesSvc = executionWorkspaceService(db);
   const workProductsSvc = workProductService(db);
   const documentsSvc = documentService(db);
@@ -2789,6 +2944,286 @@ export function issueRoutes(
     });
 
     res.json({ ok: true });
+  });
+
+  // ── JIT target list ────────────────────────────────────────────────
+  // Returns the allowlisted target machines with labels and defaults so
+  // the UI can populate the JIT SSH token request form.
+  router.get("/jit-targets", (_req, res) => {
+    const registry = loadJitTargetRegistry();
+    const targets = Object.entries(registry).map(([name, entry]) => ({
+      name,
+      label: entry.label,
+      defaultPrincipal: entry.defaultPrincipal,
+      defaultTtlMinutes: entry.defaultTtlMinutes,
+    }));
+    res.json(targets);
+  });
+
+  // ── JIT SSH token provisioning (two-phase approval flow) ───────────
+  // Phase A (no approvalId): creates a pending approval record, returns 202.
+  // Phase B (with approvalId): validates the approved approval, signs the
+  //   certificate, stores the issuance, and wakes the agent.
+  const JIT_APPROVAL_TTL_MINUTES = 10;
+
+  router.post("/issues/:id/jit-ssh-token", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+
+    // Only board (human) users may request or execute JIT SSH tokens.
+    if (req.actor.type !== "board") {
+      res.status(403).json({ error: "Only board users can provision JIT SSH tokens" });
+      return;
+    }
+
+    // Parse and validate the structured issuance request.
+    const parsed = jitIssuanceRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Invalid issuance request", details: parsed.error.flatten() });
+      return;
+    }
+    const issuanceReq = parsed.data;
+
+    // Look up the target in the allowlisted registry.
+    const target = getJitTarget(issuanceReq.target);
+    if (!target) {
+      res.status(400).json({
+        error: `Unknown target machine "${issuanceReq.target}"`,
+        allowedTargets: listJitTargets(),
+      });
+      return;
+    }
+
+    const requestedPrincipal = issuanceReq.principal ?? target.defaultPrincipal;
+    const requestedTtlMinutes = issuanceReq.ttlMinutes ?? target.defaultTtlMinutes;
+    const requestedShareTmux = issuanceReq.shareTmux ?? false;
+
+    const paramsHash = computeJitApprovalHash({
+      issueId: id,
+      target: issuanceReq.target,
+      principal: requestedPrincipal,
+      ttlMinutes: requestedTtlMinutes,
+      shareTmux: requestedShareTmux,
+      assigneeAgentId: issue.assigneeAgentId ?? null,
+    });
+
+    // ── Phase A: Request approval ──────────────────────────────────
+    const approvalId = req.body.approvalId as string | undefined;
+    if (!approvalId) {
+      const actor = getActorInfo(req);
+      const approval = await approvalsSvc.create(issue.companyId, {
+        type: "jit_ssh_token",
+        requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
+        requestedByAgentId: null,
+        payload: {
+          issueId: id,
+          target: issuanceReq.target,
+          principal: requestedPrincipal,
+          ttlMinutes: requestedTtlMinutes,
+          shareTmux: requestedShareTmux,
+          assigneeAgentId: issue.assigneeAgentId ?? null,
+          paramsHash,
+          options: issuanceReq.options ?? {},
+        },
+      });
+      await issueApprovalsSvc.link(id, approval.id, {
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      });
+
+      res.status(202).json({
+        status: "pending_approval",
+        approvalId: approval.id,
+        paramsHash,
+      });
+      return;
+    }
+
+    // ── Phase B: Execute after approval ────────────────────────────
+    const approval = await approvalsSvc.getById(approvalId);
+    if (!approval) {
+      res.status(404).json({ error: "Approval not found" });
+      return;
+    }
+
+    if (approval.type !== "jit_ssh_token") {
+      res.status(409).json({ error: "Approval is not a JIT SSH token approval" });
+      return;
+    }
+
+    if (approval.status !== "approved") {
+      res.status(409).json({ error: `Approval is not approved (current status: ${approval.status})` });
+      return;
+    }
+
+    // Verify one-time use: check consumedAt in payload.
+    const approvalPayload = approval.payload as Record<string, unknown>;
+    if (approvalPayload.consumedAt) {
+      res.status(409).json({ error: "Approval has already been consumed" });
+      return;
+    }
+
+    // Verify the approval hasn't expired (decidedAt + TTL window).
+    if (approval.decidedAt) {
+      const decidedAtMs = new Date(approval.decidedAt).getTime();
+      const expiresAtMs = decidedAtMs + JIT_APPROVAL_TTL_MINUTES * 60 * 1000;
+      if (Date.now() > expiresAtMs) {
+        res.status(409).json({ error: "Approval has expired" });
+        return;
+      }
+    }
+
+    // Verify the params hash still matches (parameters haven't changed).
+    if (approvalPayload.paramsHash !== paramsHash) {
+      res.status(409).json({ error: "Issuance parameters have changed since approval was granted" });
+      return;
+    }
+
+    try {
+      const signHeaders: Record<string, string> = { "Content-Type": "application/json" };
+      const agentAccessBearerToken = readAgentAccessBearerToken();
+      if (agentAccessBearerToken) {
+        signHeaders.Authorization = `Bearer ${agentAccessBearerToken}`;
+      }
+
+      // Generate approval ticket if secret is configured
+      let approvalTicket: ReturnType<typeof generateApprovalTicket> | undefined;
+      if (process.env.AGENT_ACCESS_TICKET_SECRET) {
+        approvalTicket = generateApprovalTicket({
+          approvalId,
+          approvedByUserId: (approval as any).decidedByUserId ?? "",
+          issueId: id,
+          paramsHash,
+          approvedAt: new Date((approval as any).decidedAt).toISOString(),
+        });
+      }
+
+      const signRes = await fetch(`${target.issuerBaseUrl}/sign-for-issue`, {
+        method: "POST",
+        headers: signHeaders,
+        body: JSON.stringify({
+          issueId: id,
+          companyId: issue.companyId,
+          target: issuanceReq.target,
+          principal: requestedPrincipal,
+          ttlMinutes: requestedTtlMinutes,
+          ttl_minutes: requestedTtlMinutes,
+          shareTmux: requestedShareTmux,
+          share_tmux: requestedShareTmux,
+          tmux_user: requestedShareTmux ? "jeffhollan" : undefined,
+          ...(issuanceReq.options ?? {}),
+          ...(approvalTicket ? { approvalTicket } : {}),
+        }),
+      });
+
+      if (!signRes.ok) {
+        const errorBody = await signRes.text().catch(() => "");
+        logger.warn({ issueId: id, target: issuanceReq.target, status: signRes.status, body: errorBody }, "agent-access sign-for-issue failed");
+        res.status(signRes.status >= 500 ? 502 : signRes.status).json({
+          error: `Agent-access service returned ${signRes.status}`,
+          detail: errorBody || undefined,
+        });
+        return;
+      }
+
+      const tokenPayload = (await signRes.json()) as RawJitSignerPayload;
+      const httpResponsePayload = buildJitHttpResponsePayload(tokenPayload, issuanceReq, target.label);
+      if (typeof httpResponsePayload.fetch_url !== "string" || httpResponsePayload.fetch_url.length === 0) {
+        logger.warn({ issueId: id, target: issuanceReq.target, tokenPayload }, "agent-access sign-for-issue returned no fetch_url");
+        res.status(502).json({ error: "Agent-access service returned an invalid token payload" });
+        return;
+      }
+
+      // Mark the approval as consumed (one-time use) by storing consumedAt in the payload.
+      // We do this before storing the issuance to prevent double-spend on concurrent requests.
+      await db
+        .update(approvalsTable)
+        .set({ payload: { ...approvalPayload, consumedAt: new Date().toISOString() } })
+        .where(drizzleEq(approvalsTable.id, approvalId));
+
+      // Store the full credential in the issuance store so agents can resolve it.
+      const issuanceId = createIssuanceId();
+      const requestedTtlMs = requestedTtlMinutes * 60 * 1000;
+      storeIssuance(issuanceId, httpResponsePayload as unknown as Record<string, unknown>, id, requestedTtlMs);
+
+      const commentPayload = buildJitIssueCommentPayload(tokenPayload, issuanceReq, target.label, issuanceId);
+
+      const structuredComment = [
+        "<!-- jit-ssh-token -->",
+        "```json",
+        JSON.stringify(commentPayload, null, 2),
+        "```",
+        "<!-- /jit-ssh-token -->",
+      ].join("\n");
+
+      const actor = getActorInfo(req);
+      const comment = await svc.addComment(id, structuredComment, {
+        userId: actor.actorType === "user" ? actor.actorId : undefined,
+      });
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          commentId: comment.id,
+          bodySnippet: "jit-ssh-token provisioned",
+          identifier: issue.identifier,
+          issueTitle: issue.title,
+        },
+      });
+
+      // Wake the assigned agent so it picks up the new credentials.
+      const assigneeId = issue.assigneeAgentId;
+      if (assigneeId) {
+        heartbeat
+          .wakeup(assigneeId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "jit_ssh_token_provisioned",
+            payload: { issueId: id, commentId: comment.id, target: issuanceReq.target },
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: {
+              issueId: id,
+              taskId: id,
+              commentId: comment.id,
+              source: "issue.jit_ssh_token",
+              wakeReason: "jit_ssh_token_provisioned",
+            },
+          })
+          .catch((err) => logger.warn({ err, issueId: id, agentId: assigneeId }, "failed to wake agent after JIT SSH token"));
+      }
+
+      res.status(201).json({ comment, token: httpResponsePayload });
+    } catch (err) {
+      logger.error({ err, issueId: id }, "JIT SSH token provisioning failed");
+      res.status(502).json({ error: "Failed to reach agent-access service" });
+    }
+  });
+
+  // ── JIT issuance resolution ────────────────────────────────────────
+  // Agents resolve an opaque issuance_id to get the actual credential.
+  // One-time use: the entry is deleted after successful resolution.
+  router.post("/issuances/:id/resolve", async (req, res) => {
+    const issuanceId = req.params.id as string;
+
+    const entry = resolveIssuance(issuanceId);
+    if (!entry) {
+      res.status(404).json({ error: "Issuance not found or already resolved" });
+      return;
+    }
+
+    res.json(entry.payload);
   });
 
   return router;

@@ -25,6 +25,7 @@ export default defineConfig(({ mode }) => ({
   server: {
     port: 5173,
     watch: createUiDevWatchOptions(process.cwd()),
+    allowedHosts: ["openclaw.int.hollan.dev"],
     proxy: {
       "/api": {
         target: "http://localhost:3100",
