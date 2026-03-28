@@ -31,6 +31,12 @@ type WakePayload = {
   issueIds: string[];
 };
 
+interface ParentIssueContext {
+  identifier: string;
+  title: string;
+  description: string;
+}
+
 type GatewayDeviceIdentity = {
   deviceId: string;
   publicKeyRawBase64Url: string;
@@ -369,6 +375,7 @@ function buildWakeText(
   paperclipEnv: Record<string, string>,
   structuredWakePrompt: string,
   claimedApiKeyPathOverride?: string | null,
+  parentContext?: ParentIssueContext | null,
 ): string {
   const claimedApiKeyPath =
     nonEmpty(claimedApiKeyPathOverride) ?? "~/.openclaw/workspace/paperclip-claimed-api-key.json";
@@ -442,6 +449,17 @@ function buildWakeText(
     `approval_id=${payload.approvalId ?? ""}`,
     `approval_status=${payload.approvalStatus ?? ""}`,
     `linked_issue_ids=${payload.issueIds.join(",")}`,
+    ...(parentContext
+      ? [
+          "",
+          `=== PARENT ISSUE CONTEXT (${parentContext.identifier}: ${parentContext.title}) ===`,
+          parentContext.description.length > 4000
+            ? `${parentContext.description.slice(0, 4000)}\n\n[truncated — full description available via GET /api/issues/{parentId}]`
+            : parentContext.description,
+          "=== END PARENT ISSUE CONTEXT ===",
+          "",
+        ]
+      : []),
     "",
     "HTTP rules:",
     "- Use Authorization: Bearer $PAPERCLIP_API_KEY on every API call.",
@@ -1140,6 +1158,59 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const structuredWakePrompt = renderPaperclipWakePrompt(ctx.context.paperclipWake);
   const structuredWakeJson = stringifyPaperclipWakePayload(ctx.context.paperclipWake);
   const claimedApiKeyPath = nonEmpty(ctx.config.claimedApiKeyPath);
+
+  // --- Fetch parent issue context (non-fatal) ---
+  let parentContext: ParentIssueContext | null = null;
+  const apiUrl = paperclipEnv.PAPERCLIP_API_URL;
+  let resolvedApiKey: string | null = null;
+  try {
+    const keyPath = claimedApiKeyPath ?? "~/.openclaw/workspace/paperclip-claimed-api-key.json";
+    const expandedPath = keyPath.replace(/^~/, process.env.HOME ?? "~");
+    const raw = readFileSync(expandedPath, "utf-8");
+    const parsed = JSON.parse(raw);
+    const token = parsed.token ?? parsed.apiKey ?? parsed.key;
+    if (typeof token === "string" && token.length > 0) {
+      resolvedApiKey = token;
+    }
+  } catch {
+    // Key file not readable — parent context fetch will be skipped.
+  }
+
+  if (wakePayload.issueId && apiUrl && resolvedApiKey) {
+    try {
+      const issueRes = await fetch(`${apiUrl}/api/issues/${wakePayload.issueId}`, {
+        headers: { Authorization: `Bearer ${resolvedApiKey}` },
+      });
+      if (issueRes.ok) {
+        const issueData = await issueRes.json();
+        const issue = Array.isArray(issueData) ? issueData[0] : issueData;
+        const parentId = issue?.parentId;
+        if (parentId) {
+          const parentRes = await fetch(`${apiUrl}/api/issues/${parentId}`, {
+            headers: { Authorization: `Bearer ${resolvedApiKey}` },
+          });
+          if (parentRes.ok) {
+            const parentData = await parentRes.json();
+            const parent = Array.isArray(parentData) ? parentData[0] : parentData;
+            if (parent?.identifier && parent?.title) {
+              parentContext = {
+                identifier: parent.identifier,
+                title: parent.title,
+                description: parent.description ?? "",
+              };
+            }
+          } else {
+            await ctx.onLog("stderr", `[openclaw-gateway] warn: failed to fetch parent issue ${parentId}: ${parentRes.status}\n`);
+          }
+        }
+      } else {
+        await ctx.onLog("stderr", `[openclaw-gateway] warn: failed to fetch issue ${wakePayload.issueId}: ${issueRes.status}\n`);
+      }
+    } catch (err) {
+      await ctx.onLog("stderr", `[openclaw-gateway] warn: parent context fetch failed: ${err}\n`);
+    }
+  }
+
   const wakeText = buildWakeText(
     wakePayload,
     paperclipEnv,
@@ -1147,6 +1218,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? joinWakePayloadSections(structuredWakePrompt, structuredWakeJson)
       : structuredWakePrompt,
     claimedApiKeyPath,
+    parentContext,
   );
 
   const sessionKeyStrategy = normalizeSessionKeyStrategy(ctx.config.sessionKeyStrategy);
