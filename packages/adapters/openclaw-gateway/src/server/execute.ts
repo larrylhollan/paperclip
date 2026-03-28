@@ -12,6 +12,7 @@ import {
   stringifyPaperclipWakePayload,
 } from "@paperclipai/adapter-utils/server-utils";
 import crypto, { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { WebSocket } from "ws";
 
 type SessionKeyStrategy = "fixed" | "issue" | "run";
@@ -369,6 +370,21 @@ function buildWakeText(
 ): string {
   const claimedApiKeyPath =
     nonEmpty(claimedApiKeyPathOverride) ?? "~/.openclaw/workspace/paperclip-claimed-api-key.json";
+
+  // Try to read the actual token from the claimed key file so agents don't have to.
+  let resolvedApiKey: string | null = null;
+  try {
+    const expandedPath = claimedApiKeyPath.replace(/^~/, process.env.HOME ?? "~");
+    const raw = readFileSync(expandedPath, "utf-8");
+    const parsed = JSON.parse(raw);
+    const token = parsed.token ?? parsed.apiKey ?? parsed.key;
+    if (typeof token === "string" && token.length > 0) {
+      resolvedApiKey = token;
+    }
+  } catch {
+    // File not found or unreadable — fall back to telling the agent to read it.
+  }
+
   const orderedKeys = [
     "PAPERCLIP_RUN_ID",
     "PAPERCLIP_AGENT_ID",
@@ -399,9 +415,13 @@ function buildWakeText(
     "",
     "Set these values in your run context:",
     ...envLines,
-    `PAPERCLIP_API_KEY=<token from ${claimedApiKeyPath}>`,
-    "",
-    `Load PAPERCLIP_API_KEY from ${claimedApiKeyPath} (the token you saved after claim-api-key).`,
+    ...(resolvedApiKey
+      ? [`PAPERCLIP_API_KEY=${resolvedApiKey}`]
+      : [
+          `PAPERCLIP_API_KEY=<token from ${claimedApiKeyPath}>`,
+          "",
+          `Load PAPERCLIP_API_KEY from ${claimedApiKeyPath} (the token you saved after claim-api-key).`,
+        ]),
     "",
     `api_base=${apiBaseHint}`,
     `task_id=${payload.taskId ?? ""}`,
