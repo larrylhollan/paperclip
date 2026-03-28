@@ -1853,6 +1853,7 @@ export function IssueDetail() {
         childIssues={panelChildIssues}
         onAddSubIssue={openNewSubIssue}
         onUpdate={handleIssuePropertiesUpdate}
+        onOpenJitDialog={() => setJitDialogOpen(true)}
       />
     );
     return () => closePanel();
@@ -2794,6 +2795,7 @@ export function IssueDetail() {
                 onAddSubIssue={openNewSubIssue}
                 onUpdate={(data) => updateIssue.mutate(data)}
                 inline
+                onOpenJitDialog={() => { setMobilePropsOpen(false); setJitDialogOpen(true); }}
               />
             </div>
           </ScrollArea>
