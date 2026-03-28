@@ -19,7 +19,7 @@ import { formatDate, cn, projectUrl } from "../lib/utils";
 import { timeAgo } from "../lib/timeAgo";
 import { Separator } from "@/components/ui/separator";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { User, Hexagon, ArrowUpRight, Tag, Plus, Trash2 } from "lucide-react";
+import { User, Hexagon, ArrowUpRight, Tag, Plus, Trash2, KeyRound } from "lucide-react";
 import { AgentIcon } from "./AgentIconPicker";
 
 function defaultProjectWorkspaceIdForProject(project: {
@@ -44,6 +44,7 @@ interface IssuePropertiesProps {
   issue: Issue;
   onUpdate: (data: Record<string, unknown>) => void;
   inline?: boolean;
+  onOpenJitDialog?: () => void;
 }
 
 function PropertyRow({ label, children }: { label: string; children: React.ReactNode }) {
@@ -117,7 +118,7 @@ function PropertyPicker({
   );
 }
 
-export function IssueProperties({ issue, onUpdate, inline }: IssuePropertiesProps) {
+export function IssueProperties({ issue, onUpdate, inline, onOpenJitDialog }: IssuePropertiesProps) {
   const { selectedCompanyId } = useCompany();
   const queryClient = useQueryClient();
   const companyId = issue.companyId ?? selectedCompanyId;
@@ -577,6 +578,23 @@ export function IssueProperties({ issue, onUpdate, inline }: IssuePropertiesProp
           </PropertyRow>
         )}
       </div>
+
+      {onOpenJitDialog && (
+        <>
+          <Separator />
+          <div className="space-y-1">
+            <span className="text-xs text-muted-foreground">Actions</span>
+            <button
+              type="button"
+              className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-accent/50"
+              onClick={onOpenJitDialog}
+            >
+              <KeyRound className="h-3.5 w-3.5 shrink-0" />
+              Grant SSH Access…
+            </button>
+          </div>
+        </>
+      )}
 
       <Separator />
 
