@@ -597,10 +597,10 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "routine scheduler tick failed");
         });
   
-      // Periodically reap orphaned runs (5-min staleness threshold) and make sure
-      // persisted queued work is still being driven forward.
+      // Periodically reap orphaned runs (configurable staleness threshold, default 25min)
+      // and make sure persisted queued work is still being driven forward.
       void heartbeat
-        .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+        .reapOrphanedRuns({ staleThresholdMs: config.reapOrphanedRunsStaleMs })
         .then(() => heartbeat.resumeQueuedRuns())
         .catch((err) => {
           logger.error({ err }, "periodic heartbeat recovery failed");

@@ -1140,30 +1140,44 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   if (wakePayload.issueId && apiUrl && resolvedApiKey) {
+    const jsonHeaders = {
+      Authorization: `Bearer ${resolvedApiKey}`,
+      Accept: "application/json",
+    };
     try {
       const issueRes = await fetch(`${apiUrl}/api/issues/${wakePayload.issueId}`, {
-        headers: { Authorization: `Bearer ${resolvedApiKey}` },
+        headers: jsonHeaders,
       });
       if (issueRes.ok) {
-        const issueData = await issueRes.json();
-        const issue = Array.isArray(issueData) ? issueData[0] : issueData;
-        const parentId = issue?.parentId;
-        if (parentId) {
-          const parentRes = await fetch(`${apiUrl}/api/issues/${parentId}`, {
-            headers: { Authorization: `Bearer ${resolvedApiKey}` },
-          });
-          if (parentRes.ok) {
-            const parentData = await parentRes.json();
-            const parent = Array.isArray(parentData) ? parentData[0] : parentData;
-            if (parent?.identifier && parent?.title) {
-              parentContext = {
-                identifier: parent.identifier,
-                title: parent.title,
-                description: parent.description ?? "",
-              };
+        const contentType = issueRes.headers.get("content-type") ?? "";
+        if (!contentType.includes("json")) {
+          await ctx.onLog("stderr", `[openclaw-gateway] warn: issue fetch returned non-JSON content-type: ${contentType}\n`);
+        } else {
+          const issueData = await issueRes.json();
+          const issue = Array.isArray(issueData) ? issueData[0] : issueData;
+          const parentId = issue?.parentId;
+          if (parentId) {
+            const parentRes = await fetch(`${apiUrl}/api/issues/${parentId}`, {
+              headers: jsonHeaders,
+            });
+            if (parentRes.ok) {
+              const parentContentType = parentRes.headers.get("content-type") ?? "";
+              if (!parentContentType.includes("json")) {
+                await ctx.onLog("stderr", `[openclaw-gateway] warn: parent issue fetch returned non-JSON content-type: ${parentContentType}\n`);
+              } else {
+                const parentData = await parentRes.json();
+                const parent = Array.isArray(parentData) ? parentData[0] : parentData;
+                if (parent?.identifier && parent?.title) {
+                  parentContext = {
+                    identifier: parent.identifier,
+                    title: parent.title,
+                    description: parent.description ?? "",
+                  };
+                }
+              }
+            } else {
+              await ctx.onLog("stderr", `[openclaw-gateway] warn: failed to fetch parent issue ${parentId}: ${parentRes.status}\n`);
             }
-          } else {
-            await ctx.onLog("stderr", `[openclaw-gateway] warn: failed to fetch parent issue ${parentId}: ${parentRes.status}\n`);
           }
         }
       } else {
