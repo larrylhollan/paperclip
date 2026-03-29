@@ -42,7 +42,7 @@ import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import { isAllowedContentType, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import { getJitTarget, listJitTargets, loadJitTargetRegistry, jitIssuanceRequestSchema } from "../jit-target-registry.js";
-import { createIssuanceId, storeIssuance, resolveIssuance } from "../jit-issuance-store.js";
+import { createIssuanceId, storeIssuance, resolveIssuance, initIssuanceStore } from "../jit-issuance-store.js";
 import { computeJitApprovalHash } from "../jit-approval-hash.js";
 import { generateApprovalTicket } from "../jit-approval-ticket.js";
 
@@ -199,6 +199,7 @@ function buildJitHttpResponsePayload(
 
 export function issueRoutes(db: Db, storage: StorageService) {
   const router = Router();
+  initIssuanceStore(db);
   const svc = issueService(db);
   const access = accessService(db);
   const heartbeat = heartbeatService(db);
@@ -1986,7 +1987,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       let approvalTicket: ReturnType<typeof generateApprovalTicket> | undefined;
       if (process.env.AGENT_ACCESS_TICKET_SECRET) {
         approvalTicket = generateApprovalTicket({
-          approvalId,
+          approvalId: approvalId,
           approvedByUserId: (approval as any).decidedByUserId ?? "",
           issueId: id,
           paramsHash,
@@ -2007,6 +2008,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
           shareTmux: requestedShareTmux,
           share_tmux: requestedShareTmux,
           tmux_user: requestedShareTmux ? "jeffhollan" : undefined,
+          assigneeAgentId: issue.assigneeAgentId ?? "",
           ...(issuanceReq.options ?? {}),
           ...(approvalTicket ? { approvalTicket } : {}),
         }),
@@ -2040,7 +2042,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       // Store the full credential in the issuance store so agents can resolve it.
       const issuanceId = createIssuanceId();
       const requestedTtlMs = requestedTtlMinutes * 60 * 1000;
-      storeIssuance(issuanceId, httpResponsePayload as unknown as Record<string, unknown>, id, requestedTtlMs);
+      await storeIssuance(issuanceId, httpResponsePayload as unknown as Record<string, unknown>, id, requestedTtlMs);
 
       const commentPayload = buildJitIssueCommentPayload(tokenPayload, issuanceReq, target.label, issuanceId);
 
@@ -2109,7 +2111,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
   router.post("/issuances/:id/resolve", async (req, res) => {
     const issuanceId = req.params.id as string;
 
-    const entry = resolveIssuance(issuanceId);
+    const entry = await resolveIssuance(issuanceId);
     if (!entry) {
       res.status(404).json({ error: "Issuance not found or already resolved" });
       return;
