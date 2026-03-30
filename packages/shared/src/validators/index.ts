@@ -273,6 +273,15 @@ export {
 } from "./access.js";
 
 export {
+  createJitPreApprovalSchema,
+  updateJitPreApprovalStatusSchema,
+  exchangeJitPreApprovalSchema,
+  type CreateJitPreApproval,
+  type UpdateJitPreApprovalStatus,
+  type ExchangeJitPreApproval,
+} from "./jit-pre-approval.js";
+
+export {
   jsonSchemaSchema,
   pluginJobDeclarationSchema,
   pluginWebhookDeclarationSchema,

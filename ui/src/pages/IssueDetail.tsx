@@ -2375,9 +2375,9 @@ export function IssueDetail() {
                         })`} />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="agent-read">agent-read (read-only)</SelectItem>
-                        <SelectItem value="agent-web">agent-web (normal dev)</SelectItem>
-                        <SelectItem value="agent-admin">agent-admin (sudo)</SelectItem>
+                        <SelectItem value="agent-read">agent-read</SelectItem>
+                        <SelectItem value="agent-web">agent-web</SelectItem>
+                        <SelectItem value="agent-admin">agent-admin</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>

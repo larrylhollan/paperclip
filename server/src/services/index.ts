@@ -36,6 +36,7 @@ export { jitPreApprovalService } from "./jit-pre-approvals.js";
 export {
   queueJitNotification,
   sendRenewalNotification,
+  editAfterQuickAction,
   signAction,
   verifyAction,
   getHmacSecret,

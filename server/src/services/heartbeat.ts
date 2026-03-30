@@ -2795,17 +2795,17 @@ export function heartbeatService(db: Db) {
         });
       }
 
-      const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
+      const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 3;
       const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+        error: shouldRetry ? `${baseMessage}; retrying (attempt ${(run.processLossRetryCount ?? 0) + 1}/3)` : baseMessage,
         errorCode: "process_lost",
         finishedAt: now,
       });
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+        error: shouldRetry ? `${baseMessage}; retrying (attempt ${(run.processLossRetryCount ?? 0) + 1}/3)` : baseMessage,
       });
       if (!finalizedRun) finalizedRun = await getRun(run.id);
       if (!finalizedRun) continue;
