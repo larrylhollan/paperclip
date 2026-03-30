@@ -87,10 +87,21 @@ export function getHmacSecret(): string {
 // In-memory message-id tracking (best-effort for editing messages after action)
 // ---------------------------------------------------------------------------
 
-const sentMessageIds = new Map<string, { chatId: string; messageId: number }>();
+interface SentMessageRef {
+  chatId: string;
+  messageId: number;
+  text: string;
+}
 
-export function trackSentMessage(preApprovalId: string, chatId: string, messageId: number) {
-  sentMessageIds.set(preApprovalId, { chatId, messageId });
+const sentMessageIds = new Map<string, SentMessageRef>();
+
+export function trackSentMessage(
+  preApprovalId: string,
+  chatId: string,
+  messageId: number,
+  text: string,
+) {
+  sentMessageIds.set(preApprovalId, { chatId, messageId, text });
 }
 
 export function getSentMessage(preApprovalId: string) {
@@ -251,7 +262,7 @@ function flushGroup(parentId: string, db: Db) {
         const messageId = await sendMessage(text, replyMarkup);
         if (messageId) {
           for (const r of entry.records) {
-            trackSentMessage(r.id, getConfig().chatId, messageId);
+            trackSentMessage(r.id, getConfig().chatId, messageId, text);
           }
         }
       } else {
@@ -281,7 +292,7 @@ function flushGroup(parentId: string, db: Db) {
         if (messageId) {
           for (const entry of group.entries) {
             for (const r of entry.records) {
-              trackSentMessage(r.id, getConfig().chatId, messageId);
+              trackSentMessage(r.id, getConfig().chatId, messageId, text);
             }
           }
         }
@@ -323,7 +334,7 @@ export function queueJitNotification(
         const messageId = await sendMessage(text, replyMarkup);
         if (messageId) {
           for (const r of records) {
-            trackSentMessage(r.id, chatId, messageId);
+            trackSentMessage(r.id, chatId, messageId, text);
           }
         }
       } catch (err) {
@@ -362,5 +373,38 @@ export async function sendRenewalNotification(
     await sendMessage(text);
   } catch (err) {
     logger.warn({ err, issueIdentifier }, "Failed to send renewal notification");
+  }
+}
+
+/**
+ * Edit a previously sent Telegram message after a quick-action approve/reject.
+ * Removes inline keyboard and appends the decision to the message text.
+ * Best-effort — failures are logged but never thrown.
+ */
+export async function editAfterQuickAction(
+  preApprovalId: string,
+  action: "approved" | "rejected",
+  target: string,
+  role: string,
+  issueIdentifier: string,
+): Promise<void> {
+  const stored = sentMessageIds.get(preApprovalId);
+  if (!stored) return;
+
+  const emoji = action === "approved" ? "✅" : "❌";
+  const verb = action === "approved" ? "Approved" : "Rejected";
+  const newText = `${stored.text}\n\n${emoji} ${verb}: ${escapeHtml(target)} (${escapeHtml(role)}) for ${escapeHtml(issueIdentifier)}`;
+
+  try {
+    // Remove buttons first
+    await editMessageReplyMarkup(stored.chatId, stored.messageId);
+    // Update text with decision
+    await editMessageText(stored.chatId, stored.messageId, newText);
+    // Update shared ref so subsequent edits on the same message accumulate
+    stored.text = newText;
+  } catch (err) {
+    logger.warn({ err, preApprovalId }, "Failed to edit Telegram message after JIT action");
+  } finally {
+    sentMessageIds.delete(preApprovalId);
   }
 }

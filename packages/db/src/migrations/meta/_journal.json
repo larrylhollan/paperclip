@@ -330,6 +330,13 @@
       "when": 1774955500000,
       "tag": "0046_jit_issuances",
       "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1775100000000,
+      "tag": "0047_jit_pre_approvals",
+      "breakpoints": true
     }
   ]
 }

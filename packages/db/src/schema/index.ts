@@ -57,3 +57,4 @@ export { pluginJobs, pluginJobRuns } from "./plugin_jobs.js";
 export { pluginWebhookDeliveries } from "./plugin_webhooks.js";
 export { pluginLogs } from "./plugin_logs.js";
 export { jitIssuances } from "./jit_issuances.js";
+export { jitPreApprovals, jitPreApprovalStatusEnum } from "./jit_pre_approvals.js";

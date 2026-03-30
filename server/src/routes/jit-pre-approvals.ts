@@ -12,9 +12,7 @@ import { assertBoard, assertCompanyAccess } from "./authz.js";
 import {
   verifyAction,
   getHmacSecret,
-  getSentMessage,
-  editMessageText,
-  editMessageReplyMarkup,
+  editAfterQuickAction,
   sendRenewalNotification,
 } from "../services/jit-notification.js";
 import { logger } from "../middleware/logger.js";
@@ -29,6 +27,83 @@ function quickActionHtml(title: string, detail: string, color: string = "#22c55e
 <p style="margin:0 0 8px;color:#333;">${detail}</p>
 <p style="color:#999;font-size:14px;margin:0;">You can close this tab.</p>
 </div></body></html>`;
+}
+
+/**
+ * Quick-action route for Telegram URL buttons. Mounted BEFORE auth middleware
+ * in app.ts — authentication is handled via HMAC signature, not session.
+ */
+export function jitQuickActionRoutes(db: Db) {
+  const router = Router();
+  const svc = jitPreApprovalService(db);
+  const issueSvc = issueService(db);
+
+  router.get("/jit-pre-approvals/:id/quick-action", async (req, res) => {
+    const id = req.params.id as string;
+    const action = req.query.action as string | undefined;
+    const sig = req.query.sig as string | undefined;
+
+    if (!action || !sig || !["approved", "rejected"].includes(action)) {
+      res.status(400).send(quickActionHtml("❌ Invalid Request", "Missing or invalid parameters.", "#ef4444"));
+      return;
+    }
+
+    const secret = getHmacSecret();
+    if (!secret) {
+      res.status(500).send(quickActionHtml("❌ Server Error", "HMAC secret not configured.", "#ef4444"));
+      return;
+    }
+
+    if (!verifyAction(id, action, sig, secret)) {
+      res.status(403).send(quickActionHtml("🚫 Forbidden", "Invalid signature. This link may have expired.", "#ef4444"));
+      return;
+    }
+
+    try {
+      const record = await svc.updateStatus(id, action as "approved" | "rejected", "quick-action-url");
+
+      // Fetch issue info for the confirmation page
+      let issueIdentifier = "";
+      let issueDetail = "";
+      try {
+        const issue = await issueSvc.getById(record.issueId);
+        if (issue) {
+          issueIdentifier = issue.identifier ?? record.issueId.slice(0, 8);
+          issueDetail = `${issueIdentifier}: ${record.target} (${record.role})`;
+        } else {
+          issueDetail = `${record.target} (${record.role})`;
+        }
+      } catch {
+        issueDetail = `${record.target} (${record.role})`;
+      }
+
+      // Best-effort: edit the Telegram message to show result and remove buttons
+      void editAfterQuickAction(
+        id,
+        action as "approved" | "rejected",
+        record.target,
+        record.role,
+        issueIdentifier || record.issueId.slice(0, 8),
+      ).catch((err) => logger.debug({ err, id }, "Could not edit Telegram message after quick-action"));
+
+      const emoji = action === "approved" ? "✅" : "❌";
+      const verb = action === "approved" ? "Approved" : "Rejected";
+      const color = action === "approved" ? "#22c55e" : "#ef4444";
+      res.status(200).send(quickActionHtml(`${emoji} ${verb}`, issueDetail, color));
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg.includes("Only pending")) {
+        res.status(200).send(quickActionHtml("ℹ️ Already Processed", "This pre-approval was already handled.", "#3b82f6"));
+      } else if (errMsg.includes("not found")) {
+        res.status(404).send(quickActionHtml("❓ Not Found", "This pre-approval record was not found.", "#f59e0b"));
+      } else {
+        logger.error({ err, id, action }, "Quick-action failed");
+        res.status(500).send(quickActionHtml("❌ Error", "Something went wrong. Please try again.", "#ef4444"));
+      }
+    }
+  });
+
+  return router;
 }
 
 export function jitPreApprovalRoutes(db: Db) {
@@ -69,74 +144,6 @@ export function jitPreApprovalRoutes(db: Db) {
     const id = req.params.id as string;
     const record = await svc.updateStatus(id, req.body.status, req.body.approvedByUserId);
     res.json(record);
-  });
-
-  // Quick-action endpoint for Telegram URL buttons (HMAC-signed, no session auth)
-  router.get("/jit-pre-approvals/:id/quick-action", async (req, res) => {
-    const id = req.params.id as string;
-    const action = req.query.action as string | undefined;
-    const sig = req.query.sig as string | undefined;
-
-    if (!action || !sig || !["approved", "rejected"].includes(action)) {
-      res.status(400).send(quickActionHtml("❌ Invalid Request", "Missing or invalid parameters.", "#ef4444"));
-      return;
-    }
-
-    const secret = getHmacSecret();
-    if (!secret) {
-      res.status(500).send(quickActionHtml("❌ Server Error", "HMAC secret not configured.", "#ef4444"));
-      return;
-    }
-
-    if (!verifyAction(id, action, sig, secret)) {
-      res.status(403).send(quickActionHtml("🚫 Forbidden", "Invalid signature. This link may have expired.", "#ef4444"));
-      return;
-    }
-
-    try {
-      const record = await svc.updateStatus(id, action as "approved" | "rejected", "quick-action-url");
-
-      // Fetch issue info for the confirmation page
-      let issueDetail = "";
-      try {
-        const issue = await issueSvc.getById(record.issueId);
-        if (issue) {
-          issueDetail = `${issue.identifier}: ${record.target} (${record.role})`;
-        } else {
-          issueDetail = `${record.target} (${record.role})`;
-        }
-      } catch {
-        issueDetail = `${record.target} (${record.role})`;
-      }
-
-      // Best-effort: edit the Telegram message to reflect the action
-      const sentMsg = getSentMessage(id);
-      if (sentMsg) {
-        const emoji = action === "approved" ? "✅" : "❌";
-        const verb = action === "approved" ? "Approved" : "Rejected";
-        try {
-          await editMessageReplyMarkup(sentMsg.chatId, sentMsg.messageId);
-        } catch (err) {
-          logger.debug({ err, id }, "Could not remove inline keyboard from notification");
-        }
-      }
-
-      const emoji = action === "approved" ? "✅" : "❌";
-      const verb = action === "approved" ? "Approved" : "Rejected";
-      const color = action === "approved" ? "#22c55e" : "#ef4444";
-      res.status(200).send(quickActionHtml(`${emoji} ${verb}`, issueDetail, color));
-    } catch (err: unknown) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      if (errMsg.includes("Only pending")) {
-        // Already acted on
-        res.status(200).send(quickActionHtml("ℹ️ Already Processed", `This pre-approval was already handled.`, "#3b82f6"));
-      } else if (errMsg.includes("not found")) {
-        res.status(404).send(quickActionHtml("❓ Not Found", "This pre-approval record was not found.", "#f59e0b"));
-      } else {
-        logger.error({ err, id, action }, "Quick-action failed");
-        res.status(500).send(quickActionHtml("❌ Error", "Something went wrong. Please try again.", "#ef4444"));
-      }
-    }
   });
 
   // Exchange an approved pre-approval for credential tracking

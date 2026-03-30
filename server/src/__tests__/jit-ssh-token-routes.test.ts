@@ -33,6 +33,7 @@ const mockAgentService = vi.hoisted(() => ({
 const mockApprovalService = vi.hoisted(() => ({
   create: vi.fn(),
   getById: vi.fn(),
+  approve: vi.fn(),
 }));
 
 const mockIssueApprovalService = vi.hoisted(() => ({
@@ -159,35 +160,30 @@ function makeApprovedApproval(overrides: Record<string, unknown> = {}) {
   };
 }
 
-/** Helper to run the full two-phase flow: request → approve → execute */
-async function requestAndExecute(
+/**
+ * Helper: set up mocks for the auto-approve single-call flow.
+ * Callers must set up addComment + fetch mocks BEFORE calling this.
+ * Returns the full supertest response (status 201 by default).
+ */
+async function autoApproveAndExecute(
   app: ReturnType<typeof createApp>,
   sendBody: Record<string, unknown>,
   approvalOverrides?: Record<string, unknown>,
+  expectedStatus = 201,
 ) {
   mockIssueService.getById.mockResolvedValue(makeIssue());
-
-  // Phase A: Request approval
   mockApprovalService.create.mockResolvedValue({ id: APPROVAL_ID });
-  const requestRes = await request(app)
-    .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-    .send(sendBody)
-    .expect(202);
+  mockApprovalService.approve.mockResolvedValue(undefined);
 
-  expect(requestRes.body.status).toBe("pending_approval");
-  const { approvalId, paramsHash } = requestRes.body;
-
-  // Phase B: Execute with approved approval
   const approval = makeApprovedApproval(approvalOverrides);
-  // Ensure the paramsHash matches for custom params
-  if (approvalOverrides?.payload) {
-    // Use the override as-is
-  } else {
-    (approval.payload as any).paramsHash = paramsHash;
-  }
   mockApprovalService.getById.mockResolvedValue(approval);
 
-  return { approvalId, paramsHash, approval };
+  const res = await request(app)
+    .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
+    .send(sendBody)
+    .expect(expectedStatus);
+
+  return res;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -213,20 +209,23 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
     _clearIssuanceStore();
   });
 
-  // ── Phase A: Request approval ────────────────────────────────────
+  // ── Phase A: Approval creation (auto-approved for board users) ───
 
-  it("returns 202 with pending approval when no approvalId is provided", async () => {
+  it("creates approval with correct type and payload", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockApprovalService.create.mockResolvedValue({ id: APPROVAL_ID });
+    mockApprovalService.approve.mockResolvedValue(undefined);
+    mockApprovalService.getById.mockResolvedValue(makeApprovedApproval());
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-create" });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => TOKEN_RESPONSE,
+    });
 
-    const res = await request(app)
+    await request(app)
       .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
       .send({ target: "work.int" })
-      .expect(202);
-
-    expect(res.body.status).toBe("pending_approval");
-    expect(res.body.approvalId).toBe(APPROVAL_ID);
-    expect(res.body.paramsHash).toEqual(expect.any(String));
+      .expect(201);
 
     // Approval created with correct type and payload
     expect(mockApprovalService.create).toHaveBeenCalledOnce();
@@ -239,26 +238,45 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
 
     // Linked to issue
     expect(mockIssueApprovalService.link).toHaveBeenCalledOnce();
+  });
 
-    // Issuer should NOT have been called yet
-    expect(mockFetch).not.toHaveBeenCalled();
+  it("auto-approves for board users and returns 201 (not 202)", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue());
+    mockApprovalService.create.mockResolvedValue({ id: APPROVAL_ID });
+    mockApprovalService.approve.mockResolvedValue(undefined);
+    mockApprovalService.getById.mockResolvedValue(makeApprovedApproval());
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-auto" });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => TOKEN_RESPONSE,
+    });
+
+    // Single request - no approvalId
+    const res = await request(app)
+      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
+      .send({ target: "work.int" })
+      .expect(201);
+
+    // Should return token, NOT pending_approval
+    expect(res.body.token).toBeDefined();
+    expect(res.body.token.type).toBe("jit-ssh-token");
+    expect(res.body.comment).toBeDefined();
+    expect(res.body.status).not.toBe("pending_approval");
+
+    // Verify approve was called (auto-approve path)
+    expect(mockApprovalService.approve).toHaveBeenCalledOnce();
   });
 
   // ── Phase B: Execute after approval ──────────────────────────────
 
-  it("provisions a token for an allowlisted target (two-phase flow)", async () => {
+  it("provisions a token for an allowlisted target", async () => {
     mockIssueService.addComment.mockResolvedValue({ id: "comment-1" });
     mockFetch.mockResolvedValue({
       ok: true,
       json: async () => TOKEN_RESPONSE,
     });
 
-    const { approvalId } = await requestAndExecute(app, { target: "work.int" });
-
-    const res = await request(app)
-      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-      .send({ target: "work.int", approvalId })
-      .expect(201);
+    const res = await autoApproveAndExecute(app, { target: "work.int" });
 
     expect(res.body.token).toMatchObject({
       type: "jit-ssh-token",
@@ -292,12 +310,7 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
       json: async () => TOKEN_RESPONSE,
     });
 
-    const { approvalId } = await requestAndExecute(app, { target: "work.int" });
-
-    await request(app)
-      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-      .send({ target: "work.int", approvalId })
-      .expect(201);
+    await autoApproveAndExecute(app, { target: "work.int" });
 
     const commentBody = mockIssueService.addComment.mock.calls[0][1] as string;
     expect(commentBody).toContain("<!-- jit-ssh-token -->");
@@ -328,7 +341,14 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
       shareTmux: true,
       assigneeAgentId: issue.assigneeAgentId,
     });
-    const approval = makeApprovedApproval({
+
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-2" });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => TOKEN_RESPONSE,
+    });
+
+    await autoApproveAndExecute(app, sendBody, {
       payload: {
         issueId: ISSUE_ID,
         target: "pc.int",
@@ -340,26 +360,6 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
         options: {},
       },
     });
-
-    mockIssueService.getById.mockResolvedValue(issue);
-    mockApprovalService.create.mockResolvedValue({ id: APPROVAL_ID });
-
-    await request(app)
-      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-      .send(sendBody)
-      .expect(202);
-
-    mockApprovalService.getById.mockResolvedValue(approval);
-    mockIssueService.addComment.mockResolvedValue({ id: "comment-2" });
-    mockFetch.mockResolvedValue({
-      ok: true,
-      json: async () => TOKEN_RESPONSE,
-    });
-
-    await request(app)
-      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-      .send({ ...sendBody, approvalId: APPROVAL_ID })
-      .expect(201);
 
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.principal).toBe("root");
@@ -379,12 +379,7 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
       json: async () => TOKEN_RESPONSE,
     });
 
-    const { approvalId } = await requestAndExecute(app, { target: "work.int" });
-
-    await request(app)
-      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-      .send({ target: "work.int", approvalId })
-      .expect(201);
+    await autoApproveAndExecute(app, { target: "work.int" });
 
     const [, opts] = mockFetch.mock.calls[0];
     expect(opts.headers).toMatchObject({
@@ -445,14 +440,6 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
     app = createApp();
 
     const issue = makeIssue();
-    mockIssueService.getById.mockResolvedValue(issue);
-    mockApprovalService.create.mockResolvedValue({ id: APPROVAL_ID });
-
-    const reqRes = await request(app)
-      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-      .send({ target: "custom.machine" })
-      .expect(202);
-
     const paramsHash = computeJitApprovalHash({
       issueId: ISSUE_ID,
       target: "custom.machine",
@@ -462,30 +449,24 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
       assigneeAgentId: issue.assigneeAgentId,
     });
 
-    mockApprovalService.getById.mockResolvedValue(
-      makeApprovedApproval({
-        payload: {
-          issueId: ISSUE_ID,
-          target: "custom.machine",
-          principal: "deploy",
-          ttlMinutes: 15,
-          shareTmux: false,
-          assigneeAgentId: issue.assigneeAgentId,
-          paramsHash,
-          options: {},
-        },
-      }),
-    );
     mockIssueService.addComment.mockResolvedValue({ id: "comment-3" });
     mockFetch.mockResolvedValue({
       ok: true,
       json: async () => ({ ...TOKEN_RESPONSE, principal: "deploy", ttlMinutes: 15 }),
     });
 
-    await request(app)
-      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-      .send({ target: "custom.machine", approvalId: APPROVAL_ID })
-      .expect(201);
+    await autoApproveAndExecute(app, { target: "custom.machine" }, {
+      payload: {
+        issueId: ISSUE_ID,
+        target: "custom.machine",
+        principal: "deploy",
+        ttlMinutes: 15,
+        shareTmux: false,
+        assigneeAgentId: issue.assigneeAgentId,
+        paramsHash,
+        options: {},
+      },
+    });
 
     expect(mockFetch.mock.calls[0][0]).toBe("https://custom-issuer.example.com/sign-for-issue");
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
@@ -493,7 +474,7 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
     expect(body.ttlMinutes).toBe(15);
   });
 
-  it("returns 403 for non-board actors", async () => {
+  it("returns 403 for non-board, non-assignee agents", async () => {
     const agentApp = express();
     agentApp.use(express.json());
     agentApp.use((req, _res, next) => {
@@ -517,7 +498,75 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
       .send({ target: "work.int" })
       .expect(403);
 
-    expect(res.body.error).toMatch(/Only board users/);
+    expect(res.body.error).toMatch(/Only board users or the assigned agent/);
+  });
+
+  it("allows the assignee agent to self-provision JIT SSH tokens", async () => {
+    // Set up self-provision policy that allows the test project/target
+    const testProjectId = "test-project-1";
+    process.env.JIT_AGENT_SELF_PROVISION_POLICY = JSON.stringify({
+      rules: [{ projectId: testProjectId, targets: ["work.int"], maxTtlMinutes: 120 }],
+    });
+    // Reset cached policy so the new env var is picked up
+    const { resetSelfProvisionPolicyCache } = await import("../routes/issues.js");
+    resetSelfProvisionPolicyCache();
+
+    const assigneeAgentId = "22222222-2222-4222-8222-222222222222";
+    const agentApp = express();
+    agentApp.use(express.json());
+    agentApp.use((req, _res, next) => {
+      (req as any).actor = {
+        type: "agent",
+        agentId: assigneeAgentId,
+        companyId: "company-1",
+        companyIds: ["company-1"],
+        source: "agent_key",
+        isInstanceAdmin: false,
+      };
+      next();
+    });
+    const agentDb = createMockDb();
+    agentApp.use("/api", issueRoutes(agentDb, {} as any));
+    agentApp.use(errorHandler);
+
+    mockIssueService.getById.mockResolvedValue({ ...makeIssue(), projectId: testProjectId });
+    mockApprovalService.create.mockResolvedValue({ id: APPROVAL_ID });
+    mockApprovalService.approve.mockResolvedValue(undefined);
+    mockApprovalService.getById.mockResolvedValue(makeApprovedApproval());
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-agent-self" });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => TOKEN_RESPONSE,
+    });
+
+    const res = await request(agentApp)
+      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
+      .send({ target: "work.int" })
+      .expect(201);
+
+    // Should auto-approve and return token (not 202 pending)
+    expect(res.body.token).toBeDefined();
+    expect(res.body.token.type).toBe("jit-ssh-token");
+    expect(res.body.status).not.toBe("pending_approval");
+
+    // Verify approval was created with requestedByAgentId
+    expect(mockApprovalService.create).toHaveBeenCalledOnce();
+    const [, approvalData] = mockApprovalService.create.mock.calls[0];
+    expect(approvalData.requestedByAgentId).toBe(assigneeAgentId);
+    expect(approvalData.requestedByUserId).toBeNull();
+
+    // Verify auto-approve was called with the self-provision note
+    expect(mockApprovalService.approve).toHaveBeenCalledOnce();
+    const approveArgs = mockApprovalService.approve.mock.calls[0];
+    expect(approveArgs[2]).toBe("Auto-approved: assignee agent self-provision");
+
+    // Verify comment includes agentId for audit trail
+    const commentOpts = mockIssueService.addComment.mock.calls[0][2];
+    expect(commentOpts.agentId).toBe(assigneeAgentId);
+
+    // Clean up
+    delete process.env.JIT_AGENT_SELF_PROVISION_POLICY;
+    resetSelfProvisionPolicyCache();
   });
 
   it("wakes the assigned agent after token provisioning", async () => {
@@ -537,33 +586,18 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
       assigneeAgentId: issue.assigneeAgentId,
     });
 
-    mockIssueService.getById.mockResolvedValue(issue);
-    mockApprovalService.create.mockResolvedValue({ id: APPROVAL_ID });
-
-    await request(app)
-      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-      .send({ target: "arch.int" })
-      .expect(202);
-
-    mockApprovalService.getById.mockResolvedValue(
-      makeApprovedApproval({
-        payload: {
-          issueId: ISSUE_ID,
-          target: "arch.int",
-          principal: "agent",
-          ttlMinutes: 60,
-          shareTmux: false,
-          assigneeAgentId: issue.assigneeAgentId,
-          paramsHash,
-          options: {},
-        },
-      }),
-    );
-
-    await request(app)
-      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-      .send({ target: "arch.int", approvalId: APPROVAL_ID })
-      .expect(201);
+    await autoApproveAndExecute(app, { target: "arch.int" }, {
+      payload: {
+        issueId: ISSUE_ID,
+        target: "arch.int",
+        principal: "agent",
+        ttlMinutes: 60,
+        shareTmux: false,
+        assigneeAgentId: issue.assigneeAgentId,
+        paramsHash,
+        options: {},
+      },
+    });
 
     expect(mockHeartbeatService.wakeup).toHaveBeenCalledOnce();
     const wakeCall = mockHeartbeatService.wakeup.mock.calls[0];
@@ -581,12 +615,7 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
       json: async () => TOKEN_RESPONSE,
     });
 
-    const { approvalId } = await requestAndExecute(app, { target: "work.int" });
-
-    await request(app)
-      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-      .send({ target: "work.int", approvalId })
-      .expect(201);
+    await autoApproveAndExecute(app, { target: "work.int" });
 
     const commentBody = mockIssueService.addComment.mock.calls[0][1] as string;
     expect(commentBody).toContain("<!-- jit-ssh-token -->");
@@ -608,12 +637,7 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
       text: async () => "bad principal",
     });
 
-    const { approvalId } = await requestAndExecute(app, { target: "work.int" });
-
-    const res = await request(app)
-      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-      .send({ target: "work.int", approvalId })
-      .expect(422);
+    const res = await autoApproveAndExecute(app, { target: "work.int" }, undefined, 422);
 
     expect(res.body.detail).toBe("bad principal");
   });
@@ -715,12 +739,7 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
       json: async () => TOKEN_RESPONSE,
     });
 
-    const { approvalId } = await requestAndExecute(app, { target: "work.int" });
-
-    await request(app)
-      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-      .send({ target: "work.int", approvalId })
-      .expect(201);
+    await autoApproveAndExecute(app, { target: "work.int" });
 
     // Verify db.update was called to mark consumed
     expect(mockDbUpdate).toHaveBeenCalled();
@@ -736,12 +755,7 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
       json: async () => TOKEN_RESPONSE,
     });
 
-    const { approvalId } = await requestAndExecute(app, { target: "work.int" });
-
-    await request(app)
-      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-      .send({ target: "work.int", approvalId })
-      .expect(201);
+    await autoApproveAndExecute(app, { target: "work.int" });
 
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.approvalTicket).toBeDefined();
@@ -760,12 +774,7 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
       json: async () => TOKEN_RESPONSE,
     });
 
-    const { approvalId } = await requestAndExecute(app, { target: "work.int" });
-
-    await request(app)
-      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-      .send({ target: "work.int", approvalId })
-      .expect(201);
+    await autoApproveAndExecute(app, { target: "work.int" });
 
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.approvalTicket).toBeUndefined();
@@ -797,12 +806,7 @@ describe("POST /api/issuances/:id/resolve", () => {
       json: async () => TOKEN_RESPONSE,
     });
 
-    const { approvalId } = await requestAndExecute(app, { target: "work.int" });
-
-    await request(app)
-      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-      .send({ target: "work.int", approvalId })
-      .expect(201);
+    await autoApproveAndExecute(app, { target: "work.int" });
 
     // Extract the issuance_id from the comment.
     const commentBody = mockIssueService.addComment.mock.calls[0][1] as string;
@@ -836,12 +840,7 @@ describe("POST /api/issuances/:id/resolve", () => {
       json: async () => TOKEN_RESPONSE,
     });
 
-    const { approvalId } = await requestAndExecute(app, { target: "work.int" });
-
-    await request(app)
-      .post(`/api/issues/${ISSUE_ID}/jit-ssh-token`)
-      .send({ target: "work.int", approvalId })
-      .expect(201);
+    await autoApproveAndExecute(app, { target: "work.int" });
 
     const commentBody = mockIssueService.addComment.mock.calls[0][1] as string;
     const json = JSON.parse(
