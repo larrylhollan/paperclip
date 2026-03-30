@@ -1,5 +1,7 @@
 import type { Db } from "@paperclipai/db";
 import { jitPreApprovalService } from "./jit-pre-approvals.js";
+import { issueService } from "./issues.js";
+import { queueJitNotification, type IssueInfo, type JitPreApprovalRecord } from "./jit-notification.js";
 import { logger } from "../middleware/logger.js";
 
 /**
@@ -64,6 +66,8 @@ export function parseJitRequirements(
  *
  * Idempotency: skip creating records where an existing record with same
  * issueId + target + role already exists (regardless of status).
+ *
+ * After creating new records, queues a Telegram notification (fire-and-forget).
  */
 export async function syncJitPreApprovals(
   db: Db,
@@ -86,9 +90,34 @@ export async function syncJitPreApprovals(
 
   if (newRecords.length === 0) return;
 
-  await svc.createForIssue(issueId, newRecords);
+  const created = await svc.createForIssue(issueId, newRecords);
   logger.info(
     { issueId, count: newRecords.length },
     "synced JIT pre-approval records from issue description",
   );
+
+  // Fire-and-forget: send Telegram notification for the new records
+  try {
+    const issueSvc = issueService(db);
+    const issue = await issueSvc.getById(issueId);
+    if (issue) {
+      const issueInfo: IssueInfo = {
+        id: issue.id,
+        identifier: issue.identifier ?? issueId,
+        title: issue.title,
+        parentId: issue.parentId,
+      };
+      const notifyRecords: JitPreApprovalRecord[] = created.map((r) => ({
+        id: r.id,
+        issueId: r.issueId,
+        target: r.target,
+        role: r.role,
+        reason: r.reason,
+        status: r.status,
+      }));
+      queueJitNotification(db, issueInfo, notifyRecords);
+    }
+  } catch (err) {
+    logger.warn({ err, issueId }, "Failed to queue JIT notification after sync");
+  }
 }
