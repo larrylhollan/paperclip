@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
 import {
@@ -16,6 +17,8 @@ import {
   sendRenewalNotification,
 } from "../services/jit-notification.js";
 import { logger } from "../middleware/logger.js";
+import { getJitTarget } from "../jit-target-registry.js";
+import { createIssuanceId, storeIssuance } from "../jit-issuance-store.js";
 
 function quickActionHtml(title: string, detail: string, color: string = "#22c55e"): string {
   return `<!DOCTYPE html>
@@ -106,6 +109,135 @@ export function jitQuickActionRoutes(db: Db) {
   return router;
 }
 
+// ── SSH credential generation helper ─────────────────────────────────
+
+function readAgentAccessBearerToken(): string | undefined {
+  const inlineToken = process.env.AGENT_ACCESS_BEARER_TOKEN?.trim();
+  if (inlineToken) return inlineToken;
+  const tokenFile = process.env.AGENT_ACCESS_BEARER_TOKEN_FILE?.trim();
+  if (!tokenFile) return undefined;
+  try {
+    return readFileSync(tokenFile, "utf8").trim() || undefined;
+  } catch (err) {
+    logger.warn({ err, tokenFile }, "failed to read agent-access bearer token file");
+    return undefined;
+  }
+}
+
+type SignerResponse = {
+  fetch_url?: string;
+  fetchUrl?: string;
+  ssh_host?: string;
+  sshHost?: string;
+  target_host?: string;
+  targetHost?: string;
+  ssh_user?: string;
+  sshUser?: string;
+  principal?: string;
+  cert_id?: string;
+  certId?: string;
+  ttl_minutes?: number;
+  ttlMinutes?: number;
+  issued_at?: string;
+  issuedAt?: string;
+  expires_at?: string;
+  expiresAt?: string;
+};
+
+/**
+ * Call the SSH CA signer and store the issuance. Returns credential fields
+ * to merge into the API response, or null if credential generation fails
+ * (caller should still return the DB record).
+ */
+async function issueCredentialForPreApproval(
+  target: string,
+  principal: string,
+  issueId: string,
+  ttlMinutes: number,
+): Promise<Record<string, unknown> | null> {
+  const entry = getJitTarget(target);
+  if (!entry) {
+    logger.warn({ target }, "pre-approval exchange: target not in JIT registry");
+    return null;
+  }
+
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const bearerToken = readAgentAccessBearerToken();
+  if (bearerToken) {
+    headers.Authorization = `Bearer ${bearerToken}`;
+  }
+
+  let signRes: Response;
+  try {
+    signRes = await fetch(`${entry.issuerBaseUrl}/sign-for-issue`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        issueId,
+        target,
+        principal,
+        ttlMinutes,
+        ttl_minutes: ttlMinutes,
+      }),
+    });
+  } catch (err) {
+    logger.error({ err, target, issueId }, "pre-approval credential: fetch failed");
+    return null;
+  }
+
+  if (!signRes.ok) {
+    const body = await signRes.text().catch(() => "");
+    logger.warn({ target, issueId, status: signRes.status, body }, "pre-approval credential: sign-for-issue failed");
+    return null;
+  }
+
+  const raw = (await signRes.json()) as SignerResponse;
+
+  const fetchUrl = raw.fetch_url ?? raw.fetchUrl;
+  const sshHost = raw.ssh_host ?? raw.sshHost ?? raw.target_host ?? raw.targetHost;
+  const sshUser = raw.ssh_user ?? raw.sshUser;
+  const certId = raw.cert_id ?? raw.certId;
+  const issuedAt = raw.issued_at ?? raw.issuedAt;
+  const expiresAt = raw.expires_at ?? raw.expiresAt;
+  const resolvedTtl = raw.ttl_minutes ?? raw.ttlMinutes ?? ttlMinutes;
+
+  // Store in issuance store so agents can resolve via fetch_url
+  if (fetchUrl) {
+    const issuanceId = createIssuanceId();
+    const ttlMs = resolvedTtl * 60 * 1000;
+    await storeIssuance(
+      issuanceId,
+      {
+        type: "jit-ssh-token",
+        target,
+        principal: raw.principal ?? principal,
+        fetch_url: fetchUrl,
+        ssh_host: sshHost,
+        ssh_user: sshUser,
+        cert_id: certId,
+        ttl_minutes: resolvedTtl,
+        issued_at: issuedAt,
+        expires_at: expiresAt,
+      },
+      issueId,
+      ttlMs,
+    );
+  }
+
+  // Build credential fields for the response (omit undefined values)
+  const creds: Record<string, unknown> = {};
+  if (fetchUrl) creds.fetch_url = fetchUrl;
+  if (sshHost) creds.ssh_host = sshHost;
+  if (sshUser) creds.ssh_user = sshUser;
+  if (raw.principal ?? principal) creds.principal = raw.principal ?? principal;
+  if (certId) creds.cert_id = certId;
+  if (resolvedTtl) creds.ttl_minutes = resolvedTtl;
+  if (issuedAt) creds.issued_at = issuedAt;
+  if (expiresAt) creds.expires_at = expiresAt;
+
+  return creds;
+}
+
 export function jitPreApprovalRoutes(db: Db) {
   const router = Router();
   const svc = jitPreApprovalService(db);
@@ -146,11 +278,21 @@ export function jitPreApprovalRoutes(db: Db) {
     res.json(record);
   });
 
-  // Exchange an approved pre-approval for credential tracking
+  // Exchange an approved pre-approval for credential tracking + SSH creds
   router.post("/jit-pre-approvals/:id/exchange", validate(exchangeJitPreApprovalSchema), async (req, res) => {
     const id = req.params.id as string;
     const record = await svc.exchange(id, req.body.runId);
-    res.json(record);
+
+    // Best-effort credential generation — never block the exchange
+    const ttlMinutes = getJitTarget(record.target)?.defaultTtlMinutes ?? 120;
+    let creds: Record<string, unknown> | null = null;
+    try {
+      creds = await issueCredentialForPreApproval(record.target, record.role, record.issueId, ttlMinutes);
+    } catch (err) {
+      logger.error({ err, id }, "pre-approval exchange: credential generation failed");
+    }
+
+    res.json(creds ? { ...record, ...creds } : record);
   });
 
   // Renew an exchanged pre-approval credential
@@ -167,7 +309,16 @@ export function jitPreApprovalRoutes(db: Db) {
       logger.debug({ err, id }, "Could not send renewal notification");
     }
 
-    res.json(record);
+    // Best-effort credential generation — never block the renew
+    const ttlMinutes = getJitTarget(record.target)?.defaultTtlMinutes ?? 120;
+    let creds: Record<string, unknown> | null = null;
+    try {
+      creds = await issueCredentialForPreApproval(record.target, record.role, record.issueId, ttlMinutes);
+    } catch (err) {
+      logger.error({ err, id }, "pre-approval renew: credential generation failed");
+    }
+
+    res.json(creds ? { ...record, ...creds } : record);
   });
 
   return router;
