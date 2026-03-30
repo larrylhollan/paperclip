@@ -41,6 +41,7 @@ import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import { isAllowedContentType, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { syncJitPreApprovals } from "../services/jit-requirements-parser.js";
 import { getJitTarget, listJitTargets, loadJitTargetRegistry, jitIssuanceRequestSchema } from "../jit-target-registry.js";
 import { createIssuanceId, storeIssuance, resolveIssuance, initIssuanceStore } from "../jit-issuance-store.js";
 import { computeJitApprovalHash } from "../jit-approval-hash.js";
@@ -70,6 +71,69 @@ type RawJitSignerPayload = {
   issued_options?: Record<string, unknown>;
   options?: Record<string, unknown>;
 };
+
+// ── Agent self-provision policy ──────────────────────────────────────
+// Controls which project + target combinations allow agents to self-provision
+// JIT SSH tokens without board approval. Configured via env var:
+//
+//   JIT_AGENT_SELF_PROVISION_POLICY='{"rules":[
+//     {"projectId":"<uuid>","targets":["pc.int"],"maxTtlMinutes":120}
+//   ]}'
+//
+// If the env var is unset or empty, agent self-provisioning is disabled entirely.
+
+interface SelfProvisionRule {
+  projectId: string;
+  targets: string[];
+  maxTtlMinutes?: number;
+}
+
+interface SelfProvisionPolicy {
+  rules: SelfProvisionRule[];
+}
+
+let cachedSelfProvisionPolicy: SelfProvisionPolicy | null | undefined = undefined;
+
+function loadSelfProvisionPolicy(): SelfProvisionPolicy | null {
+  if (cachedSelfProvisionPolicy !== undefined) return cachedSelfProvisionPolicy;
+  const raw = process.env.JIT_AGENT_SELF_PROVISION_POLICY?.trim();
+  if (!raw) {
+    cachedSelfProvisionPolicy = null;
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as SelfProvisionPolicy;
+    if (!Array.isArray(parsed.rules)) {
+      cachedSelfProvisionPolicy = null;
+      return null;
+    }
+    cachedSelfProvisionPolicy = parsed;
+    return parsed;
+  } catch {
+    cachedSelfProvisionPolicy = null;
+    return null;
+  }
+}
+
+/**
+ * Check whether agent self-provisioning is allowed for the given project + target.
+ * Returns the matching rule if found, null otherwise.
+ */
+function matchSelfProvisionPolicy(projectId: string | null, target: string | null): SelfProvisionRule | null {
+  const policy = loadSelfProvisionPolicy();
+  if (!policy || !projectId) return null;
+  for (const rule of policy.rules) {
+    if (rule.projectId === projectId && (!target || rule.targets.includes(target))) {
+      return rule;
+    }
+  }
+  return null;
+}
+
+/** Reset cached policy (for tests). */
+export function resetSelfProvisionPolicyCache(): void {
+  cachedSelfProvisionPolicy = undefined;
+}
 
 function readAgentAccessBearerToken(): string | undefined {
   const inlineToken = process.env.AGENT_ACCESS_BEARER_TOKEN?.trim();
@@ -1044,6 +1108,9 @@ export function issueRoutes(db: Db, storage: StorageService) {
       requestedByActorId: actor.actorId,
     });
 
+    void syncJitPreApprovals(db, issue.id, issue.description).catch((err) =>
+      logger.warn({ err, issueId: issue.id }, "failed to sync JIT pre-approvals on issue create"));
+
     res.status(201).json(issue);
   });
 
@@ -1116,6 +1183,11 @@ export function issueRoutes(db: Db, storage: StorageService) {
       return;
     }
     await routinesSvc.syncRunStatusForIssue(issue.id);
+
+    if (req.body.description !== undefined) {
+      void syncJitPreApprovals(db, issue.id, issue.description).catch((err) =>
+        logger.warn({ err, issueId: issue.id }, "failed to sync JIT pre-approvals on issue update"));
+    }
 
     if (actor.runId) {
       await heartbeat.reportRunActivity(actor.runId).catch((err) =>
@@ -1218,7 +1290,9 @@ export function issueRoutes(db: Db, storage: StorageService) {
         });
       }
 
-      if (commentBody && comment) {
+      // Skip @-mention wakes for TG-synced comments (conversation is live in OpenClaw)
+      const isTgSync = commentBody?.startsWith("[tg-sync]");
+      if (commentBody && comment && !isTgSync) {
         let mentionedIds: string[] = [];
         try {
           mentionedIds = await svc.findMentionedAgents(issue.companyId, commentBody);
@@ -1579,6 +1653,10 @@ export function issueRoutes(db: Db, storage: StorageService) {
 
     // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
     void (async () => {
+      const isTgSync = req.body.body?.startsWith('[tg-sync]');
+      // Skip wake for synced comments - conversation is live in OpenClaw
+      if (isTgSync) return;
+
       const wakeups = new Map<string, Parameters<typeof heartbeat.wakeup>[1]>();
       const assigneeId = currentIssue.assigneeAgentId;
       const actorIsAgent = actor.actorType === "agent";
@@ -1868,10 +1946,33 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
     assertCompanyAccess(req, issue.companyId);
 
-    // Only board (human) users may request or execute JIT SSH tokens.
-    if (req.actor.type !== "board") {
-      res.status(403).json({ error: "Only board users can provision JIT SSH tokens" });
+    // Board (human) users and assignee agents may request JIT SSH tokens.
+    // Agents may only self-provision for issues assigned to them AND only when
+    // a matching JIT_AGENT_SELF_PROVISION_POLICY rule exists for the issue's
+    // project + requested target. This prevents arbitrary agent SSH access.
+    const isAssigneeAgent =
+      req.actor.type === "agent" &&
+      req.actor.agentId != null &&
+      issue.assigneeAgentId === req.actor.agentId;
+
+    if (req.actor.type !== "board" && !isAssigneeAgent) {
+      res.status(403).json({ error: "Only board users or the assigned agent can provision JIT SSH tokens" });
       return;
+    }
+
+    // For agent self-provisioning, enforce project-scoped policy.
+    // Without a matching policy rule, agents cannot self-provision even if assigned.
+    if (isAssigneeAgent) {
+      const requestedTarget = (req.body as Record<string, unknown>)?.target;
+      const policyMatch = matchSelfProvisionPolicy(issue.projectId, typeof requestedTarget === "string" ? requestedTarget : null);
+      if (!policyMatch) {
+        res.status(403).json({
+          error: "Agent self-provisioning is not enabled for this project/target combination. A board user must provision the token.",
+          projectId: issue.projectId,
+          target: requestedTarget,
+        });
+        return;
+      }
     }
 
     // Parse and validate the structured issuance request.
@@ -1893,8 +1994,16 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
 
     const requestedPrincipal = issuanceReq.principal ?? target.defaultPrincipal;
-    const requestedTtlMinutes = issuanceReq.ttlMinutes ?? target.defaultTtlMinutes;
+    let requestedTtlMinutes = issuanceReq.ttlMinutes ?? target.defaultTtlMinutes;
     const requestedShareTmux = issuanceReq.shareTmux ?? false;
+
+    // Enforce maxTtlMinutes from self-provision policy (if agent self-provisioning).
+    if (isAssigneeAgent) {
+      const policyRule = matchSelfProvisionPolicy(issue.projectId, issuanceReq.target);
+      if (policyRule?.maxTtlMinutes && requestedTtlMinutes > policyRule.maxTtlMinutes) {
+        requestedTtlMinutes = policyRule.maxTtlMinutes;
+      }
+    }
 
     const paramsHash = computeJitApprovalHash({
       issueId: id,
@@ -1912,7 +2021,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       const approval = await approvalsSvc.create(issue.companyId, {
         type: "jit_ssh_token",
         requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
-        requestedByAgentId: null,
+        requestedByAgentId: actor.actorType === "agent" ? actor.actorId : null,
         payload: {
           issueId: id,
           target: issuanceReq.target,
@@ -1928,16 +2037,28 @@ export function issueRoutes(db: Db, storage: StorageService) {
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
 
-      res.status(202).json({
-        status: "pending_approval",
-        approvalId: approval.id,
-        paramsHash,
-      });
-      return;
+      // Auto-approve for board users and assignee agents: skip the 202 pending flow and fall through to Phase B.
+      if (req.actor.type === "board" || isAssigneeAgent) {
+        const decidedByUserId = actor.actorType === "user" ? actor.actorId : "";
+        const decisionNote = isAssigneeAgent
+          ? "Auto-approved: assignee agent self-provision"
+          : "Auto-approved: board user JIT request";
+        await approvalsSvc.approve(approval.id, decidedByUserId, decisionNote);
+        // Fall through to Phase B with the now-approved approval.
+        (req.body as any).approvalId = approval.id;
+      } else {
+        res.status(202).json({
+          status: "pending_approval",
+          approvalId: approval.id,
+          paramsHash,
+        });
+        return;
+      }
     }
 
     // ── Phase B: Execute after approval ────────────────────────────
-    const approval = await approvalsSvc.getById(approvalId);
+    const resolvedApprovalId = (req.body as any).approvalId ?? approvalId;
+    const approval = await approvalsSvc.getById(resolvedApprovalId);
     if (!approval) {
       res.status(404).json({ error: "Approval not found" });
       return;
@@ -1987,7 +2108,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       let approvalTicket: ReturnType<typeof generateApprovalTicket> | undefined;
       if (process.env.AGENT_ACCESS_TICKET_SECRET) {
         approvalTicket = generateApprovalTicket({
-          approvalId: approvalId,
+          approvalId: resolvedApprovalId,
           approvedByUserId: (approval as any).decidedByUserId ?? "",
           issueId: id,
           paramsHash,
@@ -2037,7 +2158,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       await db
         .update(approvalsTable)
         .set({ payload: { ...approvalPayload, consumedAt: new Date().toISOString() } })
-        .where(drizzleEq(approvalsTable.id, approvalId));
+        .where(drizzleEq(approvalsTable.id, resolvedApprovalId));
 
       // Store the full credential in the issuance store so agents can resolve it.
       const issuanceId = createIssuanceId();
@@ -2057,6 +2178,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       const actor = getActorInfo(req);
       const comment = await svc.addComment(id, structuredComment, {
         userId: actor.actorType === "user" ? actor.actorId : undefined,
+        agentId: actor.actorType === "agent" ? actor.actorId : undefined,
       });
 
       await logActivity(db, {
