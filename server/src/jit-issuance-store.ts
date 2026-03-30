@@ -117,6 +117,22 @@ function _resolveFromMemory(issuanceId: string): IssuanceEntry | null {
   return entry;
 }
 
+export async function revokeIssuancesForIssue(issueId: string): Promise<number> {
+  if (!_db) return 0;
+  const now = new Date();
+  const result = await _db
+    .update(jitIssuances)
+    .set({ resolvedAt: now })
+    .where(
+      and(
+        eq(jitIssuances.issueId, issueId),
+        isNull(jitIssuances.resolvedAt),
+      ),
+    )
+    .returning();
+  return result.length;
+}
+
 /** Visible for testing. Resets in-memory store and DB reference. */
 export function _clearIssuanceStore(): void {
   memStore.clear();

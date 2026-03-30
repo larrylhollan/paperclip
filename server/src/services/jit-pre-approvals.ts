@@ -116,6 +116,21 @@ export function jitPreApprovalService(db: Db) {
         .then((rows) => rows[0]);
     },
 
+    async revokeForIssue(issueId: string) {
+      const now = new Date();
+      const result = await db
+        .update(jitPreApprovals)
+        .set({ status: "expired", credentialExpiresAt: now })
+        .where(
+          and(
+            eq(jitPreApprovals.issueId, issueId),
+            sql`${jitPreApprovals.status} IN ('pending', 'approved', 'exchanged')`,
+          ),
+        )
+        .returning();
+      return { revokedCount: result.length, records: result };
+    },
+
     async expireStale() {
       const now = new Date();
       const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
