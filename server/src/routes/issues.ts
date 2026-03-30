@@ -42,6 +42,7 @@ import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import { isAllowedContentType, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import { syncJitPreApprovals } from "../services/jit-requirements-parser.js";
+import { revokeCredentialsOnIssueClose } from "../services/jit-credential-revocation.js";
 import { getJitTarget, listJitTargets, loadJitTargetRegistry, jitIssuanceRequestSchema } from "../jit-target-registry.js";
 import { createIssuanceId, storeIssuance, resolveIssuance, initIssuanceStore } from "../jit-issuance-store.js";
 import { computeJitApprovalHash } from "../jit-approval-hash.js";
@@ -1183,6 +1184,16 @@ export function issueRoutes(db: Db, storage: StorageService) {
       return;
     }
     await routinesSvc.syncRunStatusForIssue(issue.id);
+
+    // Revoke JIT credentials when issue transitions to done/cancelled
+    const isClosing =
+      (issue.status === "done" || issue.status === "cancelled") &&
+      existing.status !== "done" &&
+      existing.status !== "cancelled";
+    if (isClosing) {
+      void revokeCredentialsOnIssueClose(db, issue.id, issue.status).catch((err) =>
+        logger.warn({ err, issueId: issue.id }, "failed to revoke JIT credentials on issue close"));
+    }
 
     if (req.body.description !== undefined) {
       void syncJitPreApprovals(db, issue.id, issue.description).catch((err) =>

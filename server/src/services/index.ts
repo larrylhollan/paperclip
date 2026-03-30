@@ -30,6 +30,7 @@ export { notifyHireApproved, type NotifyHireApprovedInput } from "./hire-hook.js
 export { publishLiveEvent, subscribeCompanyLiveEvents } from "./live-events.js";
 export { reconcilePersistedRuntimeServicesOnStartup } from "./workspace-runtime.js";
 export { jitPreApprovalService } from "./jit-pre-approvals.js";
+export { revokeCredentialsOnIssueClose } from "./jit-credential-revocation.js";
 export {
   queueJitNotification,
   sendRenewalNotification,
