@@ -73,6 +73,8 @@ const RECORD_APPROVED = {
   status: "approved",
   expiresAt: new Date(Date.now() + 86400000),
   renewalCount: 0,
+  approvedByUserId: "user-jeff",
+  approvedAt: new Date("2026-03-30T19:00:00Z"),
 };
 
 const RECORD_EXCHANGED = {
@@ -209,6 +211,54 @@ describe("POST /jit-pre-approvals/:id/exchange", () => {
 
     expect(res.body.status).toBe("exchanged");
     expect(res.body.fetch_url).toBeUndefined();
+  });
+
+  it("includes approvalTicket in sign-for-issue when AGENT_ACCESS_TICKET_SECRET is set", async () => {
+    process.env.AGENT_ACCESS_TICKET_SECRET = "test-ticket-secret";
+    mockPreApprovalService.exchange.mockResolvedValue(RECORD_EXCHANGED);
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => SIGNER_RESPONSE,
+    });
+
+    const app = createApp();
+    await request(app)
+      .post("/jit-pre-approvals/aaaa-bbbb/exchange")
+      .send({ runId: "run-1" })
+      .expect(200);
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [, opts] = mockFetch.mock.calls[0];
+    const body = JSON.parse(opts.body);
+    expect(body.approvalTicket).toBeDefined();
+    expect(body.approvalTicket.approvalId).toBe("aaaa-bbbb");
+    expect(body.approvalTicket.issueId).toBe("issue-1");
+    expect(body.approvalTicket.approvedByUserId).toBe("user-jeff");
+    expect(body.approvalTicket.signature).toMatch(/^[0-9a-f]{64}$/);
+    expect(body.approvalTicket.nonce).toMatch(/^[0-9a-f]{32}$/);
+    expect(body.approvalTicket.expiresAt).toBeDefined();
+
+    delete process.env.AGENT_ACCESS_TICKET_SECRET;
+  });
+
+  it("does not include approvalTicket when AGENT_ACCESS_TICKET_SECRET is not set", async () => {
+    delete process.env.AGENT_ACCESS_TICKET_SECRET;
+    mockPreApprovalService.exchange.mockResolvedValue(RECORD_EXCHANGED);
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => SIGNER_RESPONSE,
+    });
+
+    const app = createApp();
+    await request(app)
+      .post("/jit-pre-approvals/aaaa-bbbb/exchange")
+      .send({ runId: "run-1" })
+      .expect(200);
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [, opts] = mockFetch.mock.calls[0];
+    const body = JSON.parse(opts.body);
+    expect(body.approvalTicket).toBeUndefined();
   });
 });
 

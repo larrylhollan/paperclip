@@ -19,6 +19,8 @@ import {
 import { logger } from "../middleware/logger.js";
 import { getJitTarget } from "../jit-target-registry.js";
 import { createIssuanceId, storeIssuance } from "../jit-issuance-store.js";
+import { generateApprovalTicket } from "../jit-approval-ticket.js";
+import { computeJitApprovalHash } from "../jit-approval-hash.js";
 
 function quickActionHtml(title: string, detail: string, color: string = "#22c55e"): string {
   return `<!DOCTYPE html>
@@ -154,6 +156,7 @@ async function issueCredentialForPreApproval(
   principal: string,
   issueId: string,
   ttlMinutes: number,
+  preApprovalMeta?: { id: string; approvedByUserId: string | null; approvedAt: Date | null },
 ): Promise<Record<string, unknown> | null> {
   const entry = getJitTarget(target);
   if (!entry) {
@@ -167,6 +170,26 @@ async function issueCredentialForPreApproval(
     headers.Authorization = `Bearer ${bearerToken}`;
   }
 
+  // Generate approval ticket if secret is configured (matches hardened agent-access requirement)
+  let approvalTicket: ReturnType<typeof generateApprovalTicket> | undefined;
+  if (process.env.AGENT_ACCESS_TICKET_SECRET && preApprovalMeta?.approvedByUserId && preApprovalMeta?.approvedAt) {
+    const paramsHash = computeJitApprovalHash({
+      issueId,
+      target,
+      principal,
+      ttlMinutes,
+      shareTmux: false,
+      assigneeAgentId: "",
+    });
+    approvalTicket = generateApprovalTicket({
+      approvalId: preApprovalMeta.id,
+      approvedByUserId: preApprovalMeta.approvedByUserId,
+      issueId,
+      paramsHash,
+      approvedAt: new Date(preApprovalMeta.approvedAt).toISOString(),
+    });
+  }
+
   let signRes: Response;
   try {
     signRes = await fetch(`${entry.issuerBaseUrl}/sign-for-issue`, {
@@ -178,6 +201,7 @@ async function issueCredentialForPreApproval(
         principal,
         ttlMinutes,
         ttl_minutes: ttlMinutes,
+        ...(approvalTicket ? { approvalTicket } : {}),
       }),
     });
   } catch (err) {
@@ -287,7 +311,11 @@ export function jitPreApprovalRoutes(db: Db) {
     const ttlMinutes = getJitTarget(record.target)?.defaultTtlMinutes ?? 120;
     let creds: Record<string, unknown> | null = null;
     try {
-      creds = await issueCredentialForPreApproval(record.target, record.role, record.issueId, ttlMinutes);
+      creds = await issueCredentialForPreApproval(record.target, record.role, record.issueId, ttlMinutes, {
+        id: record.id,
+        approvedByUserId: record.approvedByUserId,
+        approvedAt: record.approvedAt,
+      });
     } catch (err) {
       logger.error({ err, id }, "pre-approval exchange: credential generation failed");
     }
@@ -313,7 +341,11 @@ export function jitPreApprovalRoutes(db: Db) {
     const ttlMinutes = getJitTarget(record.target)?.defaultTtlMinutes ?? 120;
     let creds: Record<string, unknown> | null = null;
     try {
-      creds = await issueCredentialForPreApproval(record.target, record.role, record.issueId, ttlMinutes);
+      creds = await issueCredentialForPreApproval(record.target, record.role, record.issueId, ttlMinutes, {
+        id: record.id,
+        approvedByUserId: record.approvedByUserId,
+        approvedAt: record.approvedAt,
+      });
     } catch (err) {
       logger.error({ err, id }, "pre-approval renew: credential generation failed");
     }
