@@ -84,6 +84,7 @@ export function jitQuickActionRoutes(db: Db) {
 
       // Best-effort: edit the Telegram message to show result and remove buttons
       void editAfterQuickAction(
+        db,
         id,
         action as "approved" | "rejected",
         record.target,

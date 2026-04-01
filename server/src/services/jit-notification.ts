@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { issues } from "@paperclipai/db";
+import { issues, jitPreApprovals } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 
@@ -84,7 +84,7 @@ export function getHmacSecret(): string {
 }
 
 // ---------------------------------------------------------------------------
-// In-memory message-id tracking (best-effort for editing messages after action)
+// DB-persisted Telegram message-id tracking
 // ---------------------------------------------------------------------------
 
 interface InlineButton {
@@ -92,27 +92,16 @@ interface InlineButton {
   url: string;
 }
 
-interface SentMessageRef {
-  chatId: string;
-  messageId: number;
-  text: string;
-  keyboard: InlineButton[][];
-}
-
-const sentMessageIds = new Map<string, SentMessageRef>();
-
-export function trackSentMessage(
+async function saveTelegramMessageId(
+  db: Db,
   preApprovalId: string,
   chatId: string,
   messageId: number,
-  text: string,
-  keyboard: InlineButton[][] = [],
-) {
-  sentMessageIds.set(preApprovalId, { chatId, messageId, text, keyboard });
-}
-
-export function getSentMessage(preApprovalId: string) {
-  return sentMessageIds.get(preApprovalId) ?? null;
+): Promise<void> {
+  await db
+    .update(jitPreApprovals)
+    .set({ telegramMessageId: messageId, telegramChatId: chatId })
+    .where(eq(jitPreApprovals.id, preApprovalId));
 }
 
 // ---------------------------------------------------------------------------
@@ -266,11 +255,13 @@ function flushGroup(parentId: string, db: Db) {
       if (group.entries.length === 1) {
         // Single issue — send individual message
         const entry = group.entries[0];
-        const { text, keyboard, replyMarkup } = buildSingleIssueMessage(entry.issue, entry.records);
-        const messageId = await sendMessage(text, replyMarkup);
+        const single = buildSingleIssueMessage(entry.issue, entry.records);
+        const messageId = await sendMessage(single.text, single.replyMarkup);
         if (messageId) {
           for (const r of entry.records) {
-            trackSentMessage(r.id, getConfig().chatId, messageId, text, keyboard);
+            void saveTelegramMessageId(db, r.id, getConfig().chatId, messageId).catch((err) =>
+              logger.debug({ err, preApprovalId: r.id }, "Failed to persist Telegram message ID"),
+            );
           }
         }
       } else {
@@ -295,12 +286,14 @@ function flushGroup(parentId: string, db: Db) {
           logger.debug({ err, parentId }, "Could not fetch parent issue for grouping");
         }
 
-        const { text, keyboard, replyMarkup } = buildGroupedMessage(parentInfo, group.entries);
-        const messageId = await sendMessage(text, replyMarkup);
+        const grouped = buildGroupedMessage(parentInfo, group.entries);
+        const messageId = await sendMessage(grouped.text, grouped.replyMarkup);
         if (messageId) {
           for (const entry of group.entries) {
             for (const r of entry.records) {
-              trackSentMessage(r.id, getConfig().chatId, messageId, text, keyboard);
+              void saveTelegramMessageId(db, r.id, getConfig().chatId, messageId).catch((err) =>
+                logger.debug({ err, preApprovalId: r.id }, "Failed to persist Telegram message ID"),
+              );
             }
           }
         }
@@ -338,11 +331,13 @@ export function queueJitNotification(
     // No parent — send immediately, no grouping
     void (async () => {
       try {
-        const { text, keyboard, replyMarkup } = buildSingleIssueMessage(issue, records);
-        const messageId = await sendMessage(text, replyMarkup);
+        const msg = buildSingleIssueMessage(issue, records);
+        const messageId = await sendMessage(msg.text, msg.replyMarkup);
         if (messageId) {
           for (const r of records) {
-            trackSentMessage(r.id, chatId, messageId, text, keyboard);
+            void saveTelegramMessageId(db, r.id, chatId, messageId).catch((err) =>
+              logger.debug({ err, preApprovalId: r.id }, "Failed to persist Telegram message ID"),
+            );
           }
         }
       } catch (err) {
@@ -386,49 +381,30 @@ export async function sendRenewalNotification(
 
 /**
  * Edit a previously sent Telegram message after a quick-action approve/reject.
- * Removes inline keyboard and appends the decision to the message text.
+ * Removes inline keyboard to signal the action was handled.
  * Best-effort — failures are logged but never thrown.
  */
 export async function editAfterQuickAction(
+  db: Db,
   preApprovalId: string,
-  action: "approved" | "rejected",
-  target: string,
-  role: string,
-  issueIdentifier: string,
+  _action: "approved" | "rejected",
+  _target: string,
+  _role: string,
+  _issueIdentifier: string,
 ): Promise<void> {
-  const stored = sentMessageIds.get(preApprovalId);
-  if (!stored) return;
-
-  const emoji = action === "approved" ? "✅" : "❌";
-  const verb = action === "approved" ? "Approved" : "Rejected";
-  const newText = `${stored.text}\n\n${emoji} ${verb}: ${escapeHtml(target)} (${escapeHtml(role)}) for ${escapeHtml(issueIdentifier)}`;
-
-  // Remove only the acted-on row from the keyboard (match by preApprovalId in URL)
-  const remainingKeyboard = stored.keyboard.filter(
-    (row) => !row.some((btn) => btn.url.includes(preApprovalId)),
-  );
+  const rows = await db
+    .select({
+      telegramMessageId: jitPreApprovals.telegramMessageId,
+      telegramChatId: jitPreApprovals.telegramChatId,
+    })
+    .from(jitPreApprovals)
+    .where(eq(jitPreApprovals.id, preApprovalId));
+  const stored = rows[0];
+  if (!stored?.telegramMessageId || !stored?.telegramChatId) return;
 
   try {
-    // Update keyboard: remaining buttons or empty if this was the last one
-    await editMessageReplyMarkup(stored.chatId, stored.messageId, remainingKeyboard);
-    // Update text with decision
-    await editMessageText(stored.chatId, stored.messageId, newText);
-
-    // Update all sibling entries that share the same Telegram message
-    for (const [sibId, sibRef] of sentMessageIds) {
-      if (
-        sibId !== preApprovalId &&
-        sibRef.messageId === stored.messageId &&
-        sibRef.chatId === stored.chatId
-      ) {
-        sibRef.text = newText;
-        sibRef.keyboard = remainingKeyboard;
-      }
-    }
+    await editMessageReplyMarkup(stored.telegramChatId, stored.telegramMessageId, []);
   } catch (err) {
     logger.warn({ err, preApprovalId }, "Failed to edit Telegram message after JIT action");
-  } finally {
-    // Only remove the acted-on entry; siblings remain for their own future actions
-    sentMessageIds.delete(preApprovalId);
   }
 }

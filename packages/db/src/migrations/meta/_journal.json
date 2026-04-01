@@ -414,6 +414,13 @@
       "when": 1775100000000,
       "tag": "0047_jit_pre_approvals",
       "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1775200000000,
+      "tag": "0048_jit_pre_approval_telegram_ids",
+      "breakpoints": true
     }
   ]
 }
