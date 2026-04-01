@@ -406,7 +406,6 @@ describe("inbox helpers", () => {
 
     expect(getApprovalsForTab(approvals, "mine", "all").map((approval) => approval.id)).toEqual([
       "approval-revision",
-      "approval-approved",
       "approval-pending",
     ]);
     expect(getApprovalsForTab(approvals, "recent", "all").map((approval) => approval.id)).toEqual([
