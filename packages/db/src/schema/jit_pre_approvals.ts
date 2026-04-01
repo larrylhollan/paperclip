@@ -21,6 +21,8 @@ export const jitPreApprovals = pgTable(
     exchangedByRunId: uuid("exchanged_by_run_id"),
     renewalCount: integer("renewal_count").notNull().default(0),
     credentialExpiresAt: timestamp("credential_expires_at", { withTimezone: true }),
+    telegramMessageId: integer("telegram_message_id"),
+    telegramChatId: text("telegram_chat_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
