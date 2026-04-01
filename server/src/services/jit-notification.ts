@@ -87,10 +87,16 @@ export function getHmacSecret(): string {
 // In-memory message-id tracking (best-effort for editing messages after action)
 // ---------------------------------------------------------------------------
 
+interface InlineButton {
+  text: string;
+  url: string;
+}
+
 interface SentMessageRef {
   chatId: string;
   messageId: number;
   text: string;
+  keyboard: InlineButton[][];
 }
 
 const sentMessageIds = new Map<string, SentMessageRef>();
@@ -100,8 +106,9 @@ export function trackSentMessage(
   chatId: string,
   messageId: number,
   text: string,
+  keyboard: InlineButton[][] = [],
 ) {
-  sentMessageIds.set(preApprovalId, { chatId, messageId, text });
+  sentMessageIds.set(preApprovalId, { chatId, messageId, text, keyboard });
 }
 
 export function getSentMessage(preApprovalId: string) {
@@ -171,11 +178,12 @@ export async function editMessageText(
 export async function editMessageReplyMarkup(
   chatId: string,
   messageId: number,
+  keyboard: InlineButton[][] = [],
 ): Promise<void> {
   await telegramPost("editMessageReplyMarkup", {
     chat_id: chatId,
     message_id: messageId,
-    reply_markup: { inline_keyboard: [] },
+    reply_markup: { inline_keyboard: keyboard },
   });
 }
 
@@ -196,7 +204,7 @@ function buildActionUrl(preApprovalId: string, action: "approved" | "rejected"):
 function buildSingleIssueMessage(
   issue: IssueInfo,
   records: JitPreApprovalRecord[],
-): { text: string; replyMarkup: unknown } {
+): { text: string; keyboard: InlineButton[][]; replyMarkup: unknown } {
   const lines = [`🔑 <b>JIT Pre-Approval Request</b>`];
   lines.push(`<b>${escapeHtml(issue.identifier)}</b>: ${escapeHtml(issue.title)}`);
   for (const r of records) {
@@ -205,18 +213,18 @@ function buildSingleIssueMessage(
   const text = lines.join("\n");
 
   // One row of approve/reject buttons per pre-approval record
-  const keyboard = records.map((r) => [
+  const keyboard: InlineButton[][] = records.map((r) => [
     { text: `✅ Approve ${r.target}`, url: buildActionUrl(r.id, "approved") },
     { text: `❌ Reject ${r.target}`, url: buildActionUrl(r.id, "rejected") },
   ]);
 
-  return { text, replyMarkup: { inline_keyboard: keyboard } };
+  return { text, keyboard, replyMarkup: { inline_keyboard: keyboard } };
 }
 
 function buildGroupedMessage(
   parentInfo: ParentIssueInfo,
   entries: QueueEntry[],
-): { text: string; replyMarkup: unknown } {
+): { text: string; keyboard: InlineButton[][]; replyMarkup: unknown } {
   const lines = [
     `🔑 <b>JIT Pre-Approvals — ${escapeHtml(parentInfo.title)} (${entries.length} issues)</b>`,
   ];
@@ -227,7 +235,7 @@ function buildGroupedMessage(
   const text = lines.join("\n");
 
   // Per-issue approve/reject buttons (each record gets its own row)
-  const keyboard: Array<Array<{ text: string; url: string }>> = [];
+  const keyboard: InlineButton[][] = [];
   for (const entry of entries) {
     for (const r of entry.records) {
       keyboard.push([
@@ -237,7 +245,7 @@ function buildGroupedMessage(
     }
   }
 
-  return { text, replyMarkup: { inline_keyboard: keyboard } };
+  return { text, keyboard, replyMarkup: { inline_keyboard: keyboard } };
 }
 
 // ---------------------------------------------------------------------------
@@ -258,11 +266,11 @@ function flushGroup(parentId: string, db: Db) {
       if (group.entries.length === 1) {
         // Single issue — send individual message
         const entry = group.entries[0];
-        const { text, replyMarkup } = buildSingleIssueMessage(entry.issue, entry.records);
+        const { text, keyboard, replyMarkup } = buildSingleIssueMessage(entry.issue, entry.records);
         const messageId = await sendMessage(text, replyMarkup);
         if (messageId) {
           for (const r of entry.records) {
-            trackSentMessage(r.id, getConfig().chatId, messageId, text);
+            trackSentMessage(r.id, getConfig().chatId, messageId, text, keyboard);
           }
         }
       } else {
@@ -287,12 +295,12 @@ function flushGroup(parentId: string, db: Db) {
           logger.debug({ err, parentId }, "Could not fetch parent issue for grouping");
         }
 
-        const { text, replyMarkup } = buildGroupedMessage(parentInfo, group.entries);
+        const { text, keyboard, replyMarkup } = buildGroupedMessage(parentInfo, group.entries);
         const messageId = await sendMessage(text, replyMarkup);
         if (messageId) {
           for (const entry of group.entries) {
             for (const r of entry.records) {
-              trackSentMessage(r.id, getConfig().chatId, messageId, text);
+              trackSentMessage(r.id, getConfig().chatId, messageId, text, keyboard);
             }
           }
         }
@@ -330,11 +338,11 @@ export function queueJitNotification(
     // No parent — send immediately, no grouping
     void (async () => {
       try {
-        const { text, replyMarkup } = buildSingleIssueMessage(issue, records);
+        const { text, keyboard, replyMarkup } = buildSingleIssueMessage(issue, records);
         const messageId = await sendMessage(text, replyMarkup);
         if (messageId) {
           for (const r of records) {
-            trackSentMessage(r.id, chatId, messageId, text);
+            trackSentMessage(r.id, chatId, messageId, text, keyboard);
           }
         }
       } catch (err) {
@@ -395,16 +403,32 @@ export async function editAfterQuickAction(
   const verb = action === "approved" ? "Approved" : "Rejected";
   const newText = `${stored.text}\n\n${emoji} ${verb}: ${escapeHtml(target)} (${escapeHtml(role)}) for ${escapeHtml(issueIdentifier)}`;
 
+  // Remove only the acted-on row from the keyboard (match by preApprovalId in URL)
+  const remainingKeyboard = stored.keyboard.filter(
+    (row) => !row.some((btn) => btn.url.includes(preApprovalId)),
+  );
+
   try {
-    // Remove buttons first
-    await editMessageReplyMarkup(stored.chatId, stored.messageId);
+    // Update keyboard: remaining buttons or empty if this was the last one
+    await editMessageReplyMarkup(stored.chatId, stored.messageId, remainingKeyboard);
     // Update text with decision
     await editMessageText(stored.chatId, stored.messageId, newText);
-    // Update shared ref so subsequent edits on the same message accumulate
-    stored.text = newText;
+
+    // Update all sibling entries that share the same Telegram message
+    for (const [sibId, sibRef] of sentMessageIds) {
+      if (
+        sibId !== preApprovalId &&
+        sibRef.messageId === stored.messageId &&
+        sibRef.chatId === stored.chatId
+      ) {
+        sibRef.text = newText;
+        sibRef.keyboard = remainingKeyboard;
+      }
+    }
   } catch (err) {
     logger.warn({ err, preApprovalId }, "Failed to edit Telegram message after JIT action");
   } finally {
+    // Only remove the acted-on entry; siblings remain for their own future actions
     sentMessageIds.delete(preApprovalId);
   }
 }
