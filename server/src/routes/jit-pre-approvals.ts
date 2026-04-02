@@ -179,7 +179,6 @@ async function issueCredentialForPreApproval(
       target,
       principal,
       ttlMinutes,
-      shareTmux: false,
       assigneeAgentId: "",
     });
     approvalTicket = generateApprovalTicket({

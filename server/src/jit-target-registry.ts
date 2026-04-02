@@ -34,8 +34,6 @@ export const jitIssuanceRequestSchema = z.object({
   principal: z.string().min(1).optional(),
   /** Certificate TTL in minutes. Falls back to target default. */
   ttlMinutes: z.number().int().positive().max(1440).optional(),
-  /** Whether to share a tmux session with the agent. */
-  shareTmux: z.boolean().optional(),
   /** Arbitrary per-target options forwarded to the issuer. */
   options: z.record(z.unknown()).optional(),
 });

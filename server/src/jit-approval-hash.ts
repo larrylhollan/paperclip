@@ -5,7 +5,6 @@ export interface JitApprovalParams {
   target: string;
   principal: string;
   ttlMinutes: number;
-  shareTmux: boolean;
   assigneeAgentId: string | null;
 }
 
@@ -15,7 +14,6 @@ export function computeJitApprovalHash(params: JitApprovalParams): string {
     params.target,
     params.principal,
     params.ttlMinutes,
-    params.shareTmux,
     params.assigneeAgentId ?? "",
   ]);
   return createHash("sha256").update(canonical).digest("hex");
