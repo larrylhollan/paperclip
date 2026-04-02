@@ -1,7 +1,7 @@
 import { createHmac } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { issues, jitPreApprovals } from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { eq, and, ne } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 
 // ---------------------------------------------------------------------------
@@ -403,7 +403,30 @@ export async function editAfterQuickAction(
   if (!stored?.telegramMessageId || !stored?.telegramChatId) return;
 
   try {
-    await editMessageReplyMarkup(stored.telegramChatId, stored.telegramMessageId, []);
+    // Query siblings that share the same Telegram message and are still pending
+    const siblings = await db
+      .select({
+        id: jitPreApprovals.id,
+        target: jitPreApprovals.target,
+        status: jitPreApprovals.status,
+      })
+      .from(jitPreApprovals)
+      .where(
+        and(
+          eq(jitPreApprovals.telegramMessageId, stored.telegramMessageId),
+          eq(jitPreApprovals.telegramChatId, stored.telegramChatId),
+          ne(jitPreApprovals.id, preApprovalId),
+          eq(jitPreApprovals.status, "pending"),
+        ),
+      );
+
+    // Rebuild keyboard from remaining pending siblings
+    const remainingKeyboard: InlineButton[][] = siblings.map((sib) => [
+      { text: `✅ Approve ${sib.target}`, url: buildActionUrl(sib.id, "approved") },
+      { text: `❌ Reject ${sib.target}`, url: buildActionUrl(sib.id, "rejected") },
+    ]);
+
+    await editMessageReplyMarkup(stored.telegramChatId, stored.telegramMessageId, remainingKeyboard);
   } catch (err) {
     logger.warn({ err, preApprovalId }, "Failed to edit Telegram message after JIT action");
   }
