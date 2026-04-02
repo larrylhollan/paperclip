@@ -2133,6 +2133,9 @@ export function issueRoutes(db: Db, storage: StorageService) {
           principal: requestedPrincipal,
           ttlMinutes: requestedTtlMinutes,
           ttl_minutes: requestedTtlMinutes,
+          // Backward-compat shim: agent-access still includes share_tmux in its paramsHash.
+          // Remove this once HOL-1077 deploys the updated agent-access code.
+          share_tmux: false,
           assigneeAgentId: issue.assigneeAgentId ?? "",
           ...(issuanceReq.options ?? {}),
           ...(approvalTicket ? { approvalTicket } : {}),
