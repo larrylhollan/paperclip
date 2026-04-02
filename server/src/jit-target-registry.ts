@@ -18,6 +18,8 @@ export const jitTargetEntrySchema = z.object({
   defaultPrincipal: z.string().min(1).default("agent"),
   /** Default TTL in minutes. */
   defaultTtlMinutes: z.number().int().positive().default(60),
+  /** Brief connection guide included in token payloads so agents know how to connect. */
+  connectionGuide: z.string().optional(),
 });
 
 export type JitTargetEntry = z.infer<typeof jitTargetEntrySchema>;
