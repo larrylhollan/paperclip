@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { execSync } from "node:child_process";
 import type { Db } from "@paperclipai/db";
 import { issues, jitPreApprovals } from "@paperclipai/db";
 import { eq, and, ne } from "drizzle-orm";
@@ -84,13 +85,28 @@ export function getHmacSecret(): string {
   return secret;
 }
 
+let _allowedUserIds: Set<string> | null = null;
+
+export function getAllowedUserIds(): Set<string> {
+  if (!_allowedUserIds) {
+    _allowedUserIds = new Set(
+      (process.env.JIT_APPROVAL_ALLOWED_USER_IDS ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+    );
+  }
+  return _allowedUserIds;
+}
+
 // ---------------------------------------------------------------------------
 // DB-persisted Telegram message-id tracking
 // ---------------------------------------------------------------------------
 
 interface InlineButton {
   text: string;
-  url: string;
+  url?: string;
+  callback_data?: string;
 }
 
 async function saveTelegramMessageId(
@@ -130,6 +146,77 @@ async function telegramPost(method: string, body: Record<string, unknown>): Prom
     logger.warn({ err, method }, "Telegram API request failed");
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Dedicated JIT approval bot (callback_data buttons)
+// ---------------------------------------------------------------------------
+
+let _jitApprovalBotToken: string | null = null;
+
+export function getJitApprovalBotToken(): string {
+  if (!_jitApprovalBotToken) {
+    try {
+      _jitApprovalBotToken = execSync(
+        "security find-generic-password -a paperclip -s jit-approval-bot-token -w",
+        { encoding: "utf8" },
+      ).trim();
+    } catch {
+      throw new Error("Could not read jit-approval-bot-token from Keychain");
+    }
+  }
+  return _jitApprovalBotToken;
+}
+
+async function telegramPostWithBot(
+  method: string,
+  body: Record<string, unknown>,
+): Promise<Record<string, unknown> | null> {
+  let botToken: string;
+  try {
+    botToken = getJitApprovalBotToken();
+  } catch (err) {
+    logger.warn({ err, method }, "JIT approval bot token unavailable");
+    return null;
+  }
+  const url = `https://api.telegram.org/bot${botToken}/${method}`;
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const data = (await resp.json()) as Record<string, unknown>;
+    if (!data.ok) {
+      logger.warn({ method, error: data }, "Telegram JIT bot API error");
+      return null;
+    }
+    return data;
+  } catch (err) {
+    logger.warn({ err, method }, "Telegram JIT bot API request failed");
+    return null;
+  }
+}
+
+async function sendJitMessage(
+  text: string,
+  replyMarkup?: unknown,
+): Promise<number | null> {
+  const { chatId, threadId } = getConfig();
+  if (!chatId) return null;
+  const body: Record<string, unknown> = {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  };
+  if (threadId) body.message_thread_id = Number(threadId);
+  if (replyMarkup) body.reply_markup = replyMarkup;
+  const result = await telegramPostWithBot("sendMessage", body);
+  if (!result) return null;
+  const msg = result.result as Record<string, unknown> | undefined;
+  return (msg?.message_id as number) ?? null;
 }
 
 async function sendMessage(
@@ -177,6 +264,18 @@ export async function editMessageReplyMarkup(
   });
 }
 
+export async function editMessageReplyMarkupWithBot(
+  chatId: string,
+  messageId: number,
+  keyboard: InlineButton[][] = [],
+): Promise<void> {
+  await telegramPostWithBot("editMessageReplyMarkup", {
+    chat_id: chatId,
+    message_id: messageId,
+    reply_markup: { inline_keyboard: keyboard },
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Notification message builders
 // ---------------------------------------------------------------------------
@@ -202,10 +301,10 @@ function buildSingleIssueMessage(
   }
   const text = lines.join("\n");
 
-  // One row of approve/reject buttons per pre-approval record
+  // One row of approve/reject callback buttons per pre-approval record
   const keyboard: InlineButton[][] = records.map((r) => [
-    { text: `✅ Approve ${r.target}`, url: buildActionUrl(r.id, "approved") },
-    { text: `❌ Reject ${r.target}`, url: buildActionUrl(r.id, "rejected") },
+    { text: `✅ Approve ${r.target}`, callback_data: `jit:approve:${r.id}` },
+    { text: `❌ Reject ${r.target}`, callback_data: `jit:reject:${r.id}` },
   ]);
 
   return { text, keyboard, replyMarkup: { inline_keyboard: keyboard } };
@@ -224,13 +323,13 @@ function buildGroupedMessage(
   }
   const text = lines.join("\n");
 
-  // Per-issue approve/reject buttons (each record gets its own row)
+  // Per-issue approve/reject callback buttons (each record gets its own row)
   const keyboard: InlineButton[][] = [];
   for (const entry of entries) {
     for (const r of entry.records) {
       keyboard.push([
-        { text: `✅ ${entry.issue.identifier} ${r.target}`, url: buildActionUrl(r.id, "approved") },
-        { text: `❌ ${entry.issue.identifier} ${r.target}`, url: buildActionUrl(r.id, "rejected") },
+        { text: `✅ ${entry.issue.identifier} ${r.target}`, callback_data: `jit:approve:${r.id}` },
+        { text: `❌ ${entry.issue.identifier} ${r.target}`, callback_data: `jit:reject:${r.id}` },
       ]);
     }
   }
@@ -254,10 +353,10 @@ function flushGroup(parentId: string, db: Db) {
   void (async () => {
     try {
       if (group.entries.length === 1) {
-        // Single issue — send individual message
+        // Single issue — send individual message via dedicated JIT bot
         const entry = group.entries[0];
         const single = buildSingleIssueMessage(entry.issue, entry.records);
-        const messageId = await sendMessage(single.text, single.replyMarkup);
+        const messageId = await sendJitMessage(single.text, single.replyMarkup);
         if (messageId) {
           for (const r of entry.records) {
             void saveTelegramMessageId(db, r.id, getConfig().chatId, messageId).catch((err) =>
@@ -288,7 +387,7 @@ function flushGroup(parentId: string, db: Db) {
         }
 
         const grouped = buildGroupedMessage(parentInfo, group.entries);
-        const messageId = await sendMessage(grouped.text, grouped.replyMarkup);
+        const messageId = await sendJitMessage(grouped.text, grouped.replyMarkup);
         if (messageId) {
           for (const entry of group.entries) {
             for (const r of entry.records) {
@@ -318,9 +417,9 @@ export function queueJitNotification(
   issue: IssueInfo,
   records: JitPreApprovalRecord[],
 ): void {
-  const { botToken, chatId } = getConfig();
-  if (!botToken || !chatId) {
-    logger.debug("JIT notification skipped: JIT_TELEGRAM_BOT_TOKEN or JIT_TELEGRAM_CHAT_ID not set");
+  const { chatId } = getConfig();
+  if (!chatId) {
+    logger.debug("JIT notification skipped: JIT_TELEGRAM_CHAT_ID not set");
     return;
   }
 
@@ -329,11 +428,11 @@ export function queueJitNotification(
   const parentId = issue.parentId;
 
   if (!parentId) {
-    // No parent — send immediately, no grouping
+    // No parent — send immediately via dedicated JIT bot, no grouping
     void (async () => {
       try {
         const msg = buildSingleIssueMessage(issue, records);
-        const messageId = await sendMessage(msg.text, msg.replyMarkup);
+        const messageId = await sendJitMessage(msg.text, msg.replyMarkup);
         if (messageId) {
           for (const r of records) {
             void saveTelegramMessageId(db, r.id, chatId, messageId).catch((err) =>
@@ -421,13 +520,13 @@ export async function editAfterQuickAction(
         ),
       );
 
-    // Rebuild keyboard from remaining pending siblings
+    // Rebuild keyboard from remaining pending siblings (callback_data buttons)
     const remainingKeyboard: InlineButton[][] = siblings.map((sib) => [
-      { text: `✅ Approve ${sib.target}`, url: buildActionUrl(sib.id, "approved") },
-      { text: `❌ Reject ${sib.target}`, url: buildActionUrl(sib.id, "rejected") },
+      { text: `✅ Approve ${sib.target}`, callback_data: `jit:approve:${sib.id}` },
+      { text: `❌ Reject ${sib.target}`, callback_data: `jit:reject:${sib.id}` },
     ]);
 
-    await editMessageReplyMarkup(stored.telegramChatId, stored.telegramMessageId, remainingKeyboard);
+    await editMessageReplyMarkupWithBot(stored.telegramChatId, stored.telegramMessageId, remainingKeyboard);
   } catch (err) {
     logger.warn({ err, preApprovalId }, "Failed to edit Telegram message after JIT action");
   }

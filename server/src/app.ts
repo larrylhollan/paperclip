@@ -31,6 +31,7 @@ import { llmRoutes } from "./routes/llms.js";
 import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { jitPreApprovalRoutes, jitQuickActionRoutes } from "./routes/jit-pre-approvals.js";
+import { jitTelegramWebhookRoutes } from "./routes/jit-telegram-webhook.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { adapterRoutes } from "./routes/adapters.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
@@ -152,6 +153,8 @@ export async function createApp(
   );
   // Mount JIT quick-action before auth — uses HMAC signatures, not sessions
   app.use("/api", jitQuickActionRoutes(db));
+  // Mount JIT Telegram webhook before auth — uses Telegram callback_query auth
+  app.use("/api", jitTelegramWebhookRoutes(db));
 
   app.use(
     actorMiddleware(db, {
