@@ -193,6 +193,7 @@ function buildJitIssueCommentPayload(
   issuanceReq: z.infer<typeof jitIssuanceRequestSchema>,
   targetLabel: string,
   issuanceId: string,
+  connectionGuide?: string,
 ) {
   const n = normalizeJitSignerPayload(rawTokenPayload, issuanceReq, targetLabel);
 
@@ -210,6 +211,7 @@ function buildJitIssueCommentPayload(
     issued_at: n.issuedAt,
     expires_at: n.expiresAt,
     issued_options: n.issuedOptions,
+    connection_guide: connectionGuide,
     // Legacy aliases retained for older agents / helpers while the canonical
     // snake_case schema rolls out.
     targetLabel: targetLabel,
@@ -222,6 +224,7 @@ function buildJitIssueCommentPayload(
     issuedAt: n.issuedAt,
     expiresAt: n.expiresAt,
     issuedOptions: n.issuedOptions,
+    connectionGuide: connectionGuide,
   });
 }
 
@@ -229,6 +232,7 @@ function buildJitHttpResponsePayload(
   rawTokenPayload: RawJitSignerPayload,
   issuanceReq: z.infer<typeof jitIssuanceRequestSchema>,
   targetLabel: string,
+  connectionGuide?: string,
 ) {
   const n = normalizeJitSignerPayload(rawTokenPayload, issuanceReq, targetLabel);
 
@@ -246,6 +250,7 @@ function buildJitHttpResponsePayload(
     issued_at: n.issuedAt,
     expires_at: n.expiresAt,
     issued_options: n.issuedOptions,
+    connection_guide: connectionGuide,
     // Legacy aliases retained for older agents / helpers while the canonical
     // snake_case schema rolls out.
     targetLabel: targetLabel,
@@ -258,6 +263,7 @@ function buildJitHttpResponsePayload(
     issuedAt: n.issuedAt,
     expiresAt: n.expiresAt,
     issuedOptions: n.issuedOptions,
+    connectionGuide: connectionGuide,
   });
 }
 
@@ -2133,9 +2139,6 @@ export function issueRoutes(db: Db, storage: StorageService) {
           principal: requestedPrincipal,
           ttlMinutes: requestedTtlMinutes,
           ttl_minutes: requestedTtlMinutes,
-          // Backward-compat shim: agent-access still includes share_tmux in its paramsHash.
-          // Remove this once HOL-1077 deploys the updated agent-access code.
-          share_tmux: false,
           assigneeAgentId: issue.assigneeAgentId ?? "",
           ...(issuanceReq.options ?? {}),
           ...(approvalTicket ? { approvalTicket } : {}),
@@ -2153,7 +2156,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       }
 
       const tokenPayload = (await signRes.json()) as RawJitSignerPayload;
-      const httpResponsePayload = buildJitHttpResponsePayload(tokenPayload, issuanceReq, target.label);
+      const httpResponsePayload = buildJitHttpResponsePayload(tokenPayload, issuanceReq, target.label, target.connectionGuide);
       if (typeof httpResponsePayload.fetch_url !== "string" || httpResponsePayload.fetch_url.length === 0) {
         logger.warn({ issueId: id, target: issuanceReq.target, tokenPayload }, "agent-access sign-for-issue returned no fetch_url");
         res.status(502).json({ error: "Agent-access service returned an invalid token payload" });
@@ -2172,7 +2175,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       const requestedTtlMs = requestedTtlMinutes * 60 * 1000;
       await storeIssuance(issuanceId, httpResponsePayload as unknown as Record<string, unknown>, id, requestedTtlMs);
 
-      const commentPayload = buildJitIssueCommentPayload(tokenPayload, issuanceReq, target.label, issuanceId);
+      const commentPayload = buildJitIssueCommentPayload(tokenPayload, issuanceReq, target.label, issuanceId, target.connectionGuide);
 
       const structuredComment = [
         "<!-- jit-ssh-token -->",

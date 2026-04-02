@@ -258,6 +258,10 @@ async function issueCredentialForPreApproval(
   if (resolvedTtl) creds.ttl_minutes = resolvedTtl;
   if (issuedAt) creds.issued_at = issuedAt;
   if (expiresAt) creds.expires_at = expiresAt;
+  if (entry.connectionGuide) {
+    creds.connection_guide = entry.connectionGuide;
+    creds.connectionGuide = entry.connectionGuide;
+  }
 
   return creds;
 }
