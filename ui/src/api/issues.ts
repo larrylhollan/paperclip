@@ -174,7 +174,6 @@ export const issuesApi = {
       target: string;
       principal?: string;
       ttlMinutes?: number;
-      shareTmux?: boolean;
       options?: Record<string, unknown>;
     },
   ) =>

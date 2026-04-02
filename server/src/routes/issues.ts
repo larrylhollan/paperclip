@@ -420,7 +420,6 @@ function normalizeJitSignerPayload(
     asRecord(rawTokenPayload.issued_options) ?? asRecord(rawTokenPayload.issuedOptions) ?? asRecord(rawTokenPayload.options);
   const requestedIssuedOptions = omitUndefined({
     ...(issuanceReq.options ?? {}),
-    share_tmux: issuanceReq.shareTmux ?? undefined,
   });
   const issuedOptions =
     signerIssuedOptions ?? (Object.keys(requestedIssuedOptions).length > 0 ? requestedIssuedOptions : undefined);
@@ -3119,7 +3118,6 @@ export function issueRoutes(
 
     const requestedPrincipal = issuanceReq.principal ?? target.defaultPrincipal;
     let requestedTtlMinutes = issuanceReq.ttlMinutes ?? target.defaultTtlMinutes;
-    const requestedShareTmux = issuanceReq.shareTmux ?? false;
 
     // Enforce maxTtlMinutes from self-provision policy (if agent self-provisioning).
     if (isAssigneeAgent) {
@@ -3134,7 +3132,6 @@ export function issueRoutes(
       target: issuanceReq.target,
       principal: requestedPrincipal,
       ttlMinutes: requestedTtlMinutes,
-      shareTmux: requestedShareTmux,
       assigneeAgentId: issue.assigneeAgentId ?? null,
     });
 
@@ -3151,7 +3148,6 @@ export function issueRoutes(
           target: issuanceReq.target,
           principal: requestedPrincipal,
           ttlMinutes: requestedTtlMinutes,
-          shareTmux: requestedShareTmux,
           assigneeAgentId: issue.assigneeAgentId ?? null,
           paramsHash,
           options: issuanceReq.options ?? {},
@@ -3250,9 +3246,6 @@ export function issueRoutes(
           principal: requestedPrincipal,
           ttlMinutes: requestedTtlMinutes,
           ttl_minutes: requestedTtlMinutes,
-          shareTmux: requestedShareTmux,
-          share_tmux: requestedShareTmux,
-          tmux_user: requestedShareTmux ? "jeffhollan" : undefined,
           assigneeAgentId: issue.assigneeAgentId ?? "",
           ...(issuanceReq.options ?? {}),
           ...(approvalTicket ? { approvalTicket } : {}),

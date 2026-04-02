@@ -73,7 +73,6 @@ import { PluginLauncherOutlet } from "@/plugins/launchers";
 import { Separator } from "@/components/ui/separator";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -871,7 +870,6 @@ export function IssueDetail() {
   const [jitTarget, setJitTarget] = useState("work.int");
   const [jitPrincipal, setJitPrincipal] = useState("");
   const [jitTtl, setJitTtl] = useState("");
-  const [jitShareTmux, setJitShareTmux] = useState(false);
   const [copied, setCopied] = useState(false);
   const [mobilePropsOpen, setMobilePropsOpen] = useState(false);
   const [mobileActionsOpen, setMobileActionsOpen] = useState(false);
@@ -1424,7 +1422,7 @@ export function IssueDetail() {
   });
 
   const requestJitSshToken = useMutation({
-    mutationFn: (opts: { target: string; principal?: string; ttlMinutes?: number; shareTmux?: boolean }) =>
+    mutationFn: (opts: { target: string; principal?: string; ttlMinutes?: number }) =>
       issuesApi.requestJitSshToken(issueId!, opts),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(issueId!) });
@@ -2333,13 +2331,12 @@ export function IssueDetail() {
                   className="grid gap-4 py-2"
                   onSubmit={(e) => {
                     e.preventDefault();
-                    const opts: { target: string; principal?: string; ttlMinutes?: number; shareTmux?: boolean } = {
+                    const opts: { target: string; principal?: string; ttlMinutes?: number } = {
                       target: jitTarget,
                     };
                     if (jitPrincipal) opts.principal = jitPrincipal;
                     const ttlNum = parseInt(jitTtl, 10);
                     if (jitTtl && !isNaN(ttlNum) && ttlNum > 0) opts.ttlMinutes = ttlNum;
-                    if (jitShareTmux) opts.shareTmux = true;
                     requestJitSshToken.mutate(opts);
                   }}
                 >
@@ -2396,18 +2393,6 @@ export function IssueDetail() {
                       value={jitTtl}
                       onChange={(e) => setJitTtl(e.target.value)}
                     />
-                  </div>
-
-                  {/* Share tmux */}
-                  <div className="flex items-center gap-2">
-                    <Checkbox
-                      id="jit-tmux"
-                      checked={jitShareTmux}
-                      onCheckedChange={(v) => setJitShareTmux(v === true)}
-                    />
-                    <Label htmlFor="jit-tmux" className="text-sm font-normal">
-                      Share tmux session with agent
-                    </Label>
                   </div>
 
                   {/* Error display */}

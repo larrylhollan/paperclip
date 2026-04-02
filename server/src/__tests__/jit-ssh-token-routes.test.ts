@@ -136,7 +136,6 @@ function makeApprovedApproval(overrides: Record<string, unknown> = {}) {
     target: "work.int",
     principal: "agent",
     ttlMinutes: 60,
-    shareTmux: false,
     assigneeAgentId: issue.assigneeAgentId,
   });
   return {
@@ -151,7 +150,6 @@ function makeApprovedApproval(overrides: Record<string, unknown> = {}) {
       target: "work.int",
       principal: "agent",
       ttlMinutes: 60,
-      shareTmux: false,
       assigneeAgentId: issue.assigneeAgentId,
       paramsHash,
       options: {},
@@ -298,8 +296,6 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
       principal: "agent",
       ttlMinutes: 60,
       ttl_minutes: 60,
-      shareTmux: false,
-      share_tmux: false,
     });
   });
 
@@ -330,15 +326,14 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
     expect(json.fetchUrl).toBeUndefined();
   });
 
-  it("forwards custom principal, ttlMinutes, and shareTmux to the issuer", async () => {
-    const sendBody = { target: "pc.int", principal: "root", ttlMinutes: 30, shareTmux: true };
+  it("forwards custom principal and ttlMinutes to the issuer", async () => {
+    const sendBody = { target: "pc.int", principal: "root", ttlMinutes: 30 };
     const issue = makeIssue();
     const paramsHash = computeJitApprovalHash({
       issueId: ISSUE_ID,
       target: "pc.int",
       principal: "root",
       ttlMinutes: 30,
-      shareTmux: true,
       assigneeAgentId: issue.assigneeAgentId,
     });
 
@@ -354,7 +349,6 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
         target: "pc.int",
         principal: "root",
         ttlMinutes: 30,
-        shareTmux: true,
         assigneeAgentId: issue.assigneeAgentId,
         paramsHash,
         options: {},
@@ -365,9 +359,6 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
     expect(body.principal).toBe("root");
     expect(body.ttlMinutes).toBe(30);
     expect(body.ttl_minutes).toBe(30);
-    expect(body.shareTmux).toBe(true);
-    expect(body.share_tmux).toBe(true);
-    expect(body.tmux_user).toBe("jeffhollan");
     expect(body.target).toBe("pc.int");
   });
 
@@ -445,7 +436,6 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
       target: "custom.machine",
       principal: "deploy",
       ttlMinutes: 15,
-      shareTmux: false,
       assigneeAgentId: issue.assigneeAgentId,
     });
 
@@ -461,7 +451,6 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
         target: "custom.machine",
         principal: "deploy",
         ttlMinutes: 15,
-        shareTmux: false,
         assigneeAgentId: issue.assigneeAgentId,
         paramsHash,
         options: {},
@@ -582,7 +571,6 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
       target: "arch.int",
       principal: "agent",
       ttlMinutes: 60,
-      shareTmux: false,
       assigneeAgentId: issue.assigneeAgentId,
     });
 
@@ -592,7 +580,6 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
         target: "arch.int",
         principal: "agent",
         ttlMinutes: 60,
-        shareTmux: false,
         assigneeAgentId: issue.assigneeAgentId,
         paramsHash,
         options: {},
