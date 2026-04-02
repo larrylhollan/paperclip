@@ -143,14 +143,13 @@ class ApprovalTicketVerifier:
 
         Must match computeJitApprovalHash() in jit-approval-hash.ts:
           JSON.stringify([issueId, target, principal, ttlMinutes,
-                          shareTmux, assigneeAgentId ?? ""])
+                          assigneeAgentId ?? ""])
         """
         canonical = json.dumps([
             params.get("issueId", ""),
             params.get("target", ""),
             params.get("principal", ""),
             params.get("ttlMinutes", 0),
-            params.get("shareTmux", False),
             params.get("assigneeAgentId") or "",
         ], separators=(",", ":"))
         return hashlib.sha256(canonical.encode()).hexdigest()
