@@ -42,10 +42,7 @@ function getConfig() {
   const botToken = process.env.JIT_TELEGRAM_BOT_TOKEN ?? "";
   const chatId = process.env.JIT_TELEGRAM_CHAT_ID ?? "";
   const threadId = process.env.JIT_TELEGRAM_THREAD_ID ?? undefined;
-  const hmacSecret =
-    process.env.JIT_APPROVAL_HMAC_SECRET ??
-    process.env.BETTER_AUTH_SECRET ??
-    "";
+  const hmacSecret = process.env.JIT_APPROVAL_HMAC_SECRET ?? "";
   const publicUrl = (
     process.env.JIT_APPROVAL_PUBLIC_URL ?? "http://127.0.0.1:3100"
   ).replace(/\/$/, "");
@@ -80,7 +77,11 @@ export function verifyAction(
 }
 
 export function getHmacSecret(): string {
-  return getConfig().hmacSecret;
+  const secret = getConfig().hmacSecret;
+  if (!secret) {
+    logger.warn("JIT_APPROVAL_HMAC_SECRET is not set — quick-action approval URLs will be rejected");
+  }
+  return secret;
 }
 
 // ---------------------------------------------------------------------------

@@ -501,7 +501,15 @@ export async function startServer(): Promise<StartedServer> {
     await initializeBoardClaimChallenge(db as any, { deploymentMode: config.deploymentMode });
     authReady = true;
   }
-  
+
+  if (process.env.JIT_TELEGRAM_BOT_TOKEN && !process.env.JIT_APPROVAL_HMAC_SECRET) {
+    logger.warn(
+      "JIT_TELEGRAM_BOT_TOKEN is set but JIT_APPROVAL_HMAC_SECRET is not — " +
+      "quick-action approval URLs will not work. " +
+      "Set JIT_APPROVAL_HMAC_SECRET to a dedicated secret (do NOT reuse BETTER_AUTH_SECRET)."
+    );
+  }
+
   const listenPort = await detectPort(config.port);
   if (listenPort !== config.port) {
     config.port = listenPort;
