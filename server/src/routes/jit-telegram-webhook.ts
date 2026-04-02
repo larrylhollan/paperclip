@@ -1,12 +1,9 @@
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
-import { jitPreApprovals } from "@paperclipai/db";
-import { eq, and, ne } from "drizzle-orm";
 import { jitPreApprovalService } from "../services/jit-pre-approvals.js";
 import {
   getJitApprovalBotToken,
   getAllowedUserIds,
-  editMessageReplyMarkupWithBot,
 } from "../services/jit-notification.js";
 import { logger } from "../middleware/logger.js";
 
@@ -92,37 +89,10 @@ export function jitTelegramWebhookRoutes(db: Db) {
       const verb = status === "approved" ? "Approved" : "Rejected";
       await answerCallbackQuery(cbq.id, `${emoji} ${verb}!`);
 
-      // Best-effort: rebuild keyboard with remaining pending siblings
-      if (cbq.message) {
-        const chatId = String(cbq.message.chat.id);
-        const messageId = cbq.message.message_id;
-
-        try {
-          const siblings = await db
-            .select({
-              id: jitPreApprovals.id,
-              target: jitPreApprovals.target,
-            })
-            .from(jitPreApprovals)
-            .where(
-              and(
-                eq(jitPreApprovals.telegramMessageId, messageId),
-                eq(jitPreApprovals.telegramChatId, chatId),
-                ne(jitPreApprovals.id, preApprovalId),
-                eq(jitPreApprovals.status, "pending"),
-              ),
-            );
-
-          const remainingKeyboard = siblings.map((sib) => [
-            { text: `✅ Approve ${sib.target}`, callback_data: `jit:approve:${sib.id}` },
-            { text: `❌ Reject ${sib.target}`, callback_data: `jit:reject:${sib.id}` },
-          ]);
-
-          await editMessageReplyMarkupWithBot(chatId, messageId, remainingKeyboard);
-        } catch (editErr) {
-          logger.debug({ err: editErr, preApprovalId }, "Could not edit message after callback action");
-        }
-      }
+      // With callback_query buttons, do NOT edit the keyboard.
+      // Each button press is independent — Telegram handles the UI.
+      // The buttons stay on the message, and re-tapping an already-processed
+      // one returns "Already processed" via answerCallbackQuery above.
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (errMsg.includes("Only pending")) {
