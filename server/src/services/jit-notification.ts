@@ -233,7 +233,10 @@ async function sendMessage(
   };
   if (threadId) body.message_thread_id = Number(threadId);
   if (replyMarkup) body.reply_markup = replyMarkup;
-  const result = await telegramPost("sendMessage", body);
+  // Use the dedicated JIT approval bot (callback buttons require matching bot)
+  // Fall back to the old bot if the approval bot token isn't available
+  const result = await telegramPostWithBot("sendMessage", body)
+    ?? await telegramPost("sendMessage", body);
   if (!result) return null;
   const msg = result.result as Record<string, unknown> | undefined;
   return (msg?.message_id as number) ?? null;
