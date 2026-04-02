@@ -14,9 +14,6 @@ export function computeJitApprovalHash(params: JitApprovalParams): string {
     params.target,
     params.principal,
     params.ttlMinutes,
-    // Backward-compat: agent-access still includes share_tmux=false in its hash.
-    // Remove this once HOL-1077 deploys the updated agent-access code.
-    false,
     params.assigneeAgentId ?? "",
   ]);
   return createHash("sha256").update(canonical).digest("hex");
