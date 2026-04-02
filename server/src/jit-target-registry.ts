@@ -44,6 +44,63 @@ export type JitIssuanceRequest = z.infer<typeof jitIssuanceRequestSchema>;
 
 // ── Registry loading ────────────────────────────────────────────────
 
+// ── Inline connection guides (travel with every token payload) ──────
+// Keep these concise — they're embedded in JSON comments/responses.
+// Full reference: CONNECT.md on each host.
+
+const CONNECTION_GUIDE_WORK_INT = [
+  "## Quick Connection Guide — work.int",
+  "You are operating as `agent` in jeffhollan's user space (macOS, Apple Silicon).",
+  "ALWAYS use jit_connect.py for commands — never raw SSH or tmux.",
+  "",
+  "Run commands:  jit_connect.py --issue-id $ISSUE_ID -- <command>",
+  "Tmux window:   jit_connect.py --issue-id $ISSUE_ID --tmux-window <name>",
+  "Tmux socket:   /Users/jeffhollan/.tmux-shared/bridge",
+  "Tmux binary:   /opt/homebrew/bin/tmux",
+  "",
+  "You do NOT have sudo. To request elevated access:",
+  "  Paperclip issue: use issue_topic.py to message Jeff, set issue to blocked",
+  "  Ad-hoc: message Jeff via Telegram with what you need and why",
+  "",
+  "Do NOT: run raw tmux/SSH, chmod files, modify shell profiles, kill other processes.",
+  "Full guide: cat ~/CONNECT.md",
+].join("\n");
+
+const CONNECTION_GUIDE_PC_INT = [
+  "## Quick Connection Guide — pc.int",
+  "You are operating as `agent` in jeffhollan's user space (Linux/Ubuntu).",
+  "ALWAYS use jit_connect.py for commands — never raw SSH or tmux.",
+  "NOTE: SSH port is 2222 (not 22).",
+  "",
+  "Run commands:  jit_connect.py --issue-id $ISSUE_ID --target pc.int -- <command>",
+  "Tmux window:   jit_connect.py --issue-id $ISSUE_ID --target pc.int --tmux-window <name>",
+  "Tmux socket:   /run/tmux-shared/bridge",
+  "",
+  "You do NOT have sudo. To request elevated access:",
+  "  Paperclip issue: use issue_topic.py to message Jeff, set issue to blocked",
+  "  Ad-hoc: message Jeff via Telegram with what you need and why",
+  "",
+  "Do NOT: run raw tmux/SSH, chmod files, modify shell profiles, kill other processes.",
+  "Full guide: cat ~/CONNECT.md",
+].join("\n");
+
+const CONNECTION_GUIDE_ARCH_INT = [
+  "## Quick Connection Guide — arch.int",
+  "You are operating as `agent` in jeffhollan's user space (Linux/Arch).",
+  "ALWAYS use jit_connect.py for commands — never raw SSH or tmux.",
+  "",
+  "Run commands:  jit_connect.py --issue-id $ISSUE_ID --target arch.int -- <command>",
+  "Tmux window:   jit_connect.py --issue-id $ISSUE_ID --target arch.int --tmux-window <name>",
+  "Tmux socket:   /tmp/tmux-1000/default",
+  "",
+  "You do NOT have sudo. To request elevated access:",
+  "  Paperclip issue: use issue_topic.py to message Jeff, set issue to blocked",
+  "  Ad-hoc: message Jeff via Telegram with what you need and why",
+  "",
+  "Do NOT: run raw tmux/SSH, chmod files, modify shell profiles, kill other processes.",
+  "Full guide: cat ~/CONNECT.md",
+].join("\n");
+
 function buildFallbackRegistry(): JitTargetRegistry {
   const baseUrl = process.env.AGENT_ACCESS_BASE_URL;
   if (!baseUrl) return {};
@@ -53,18 +110,21 @@ function buildFallbackRegistry(): JitTargetRegistry {
       issuerBaseUrl: baseUrl,
       defaultPrincipal: "agent",
       defaultTtlMinutes: 60,
+      connectionGuide: CONNECTION_GUIDE_WORK_INT,
     },
     "pc.int": {
       label: "Paperclip",
       issuerBaseUrl: baseUrl,
       defaultPrincipal: "agent",
       defaultTtlMinutes: 60,
+      connectionGuide: CONNECTION_GUIDE_PC_INT,
     },
     "arch.int": {
       label: "Arch",
       issuerBaseUrl: baseUrl,
       defaultPrincipal: "agent",
       defaultTtlMinutes: 60,
+      connectionGuide: CONNECTION_GUIDE_ARCH_INT,
     },
   };
 }
