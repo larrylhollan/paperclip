@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { Router } from "express";
+import { fetchWithRetry } from "../jit-fetch-retry.js";
 import type { Db } from "@paperclipai/db";
 import {
   createJitPreApprovalSchema,
@@ -192,7 +193,7 @@ async function issueCredentialForPreApproval(
 
   let signRes: Response;
   try {
-    signRes = await fetch(`${entry.issuerBaseUrl}/sign-for-issue`, {
+    signRes = await fetchWithRetry(`${entry.issuerBaseUrl}/sign-for-issue`, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -203,7 +204,7 @@ async function issueCredentialForPreApproval(
         ttl_minutes: ttlMinutes,
         ...(approvalTicket ? { approvalTicket } : {}),
       }),
-    });
+    }, { label: "pre-approval-credential" });
   } catch (err) {
     logger.error({ err, target, issueId }, "pre-approval credential: fetch failed");
     return null;

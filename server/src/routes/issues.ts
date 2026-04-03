@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import { readFileSync } from "node:fs";
+import { fetchWithRetry } from "../jit-fetch-retry.js";
 import multer from "multer";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
@@ -3242,7 +3243,7 @@ export function issueRoutes(
         });
       }
 
-      const signRes = await fetch(`${target.issuerBaseUrl}/sign-for-issue`, {
+      const signRes = await fetchWithRetry(`${target.issuerBaseUrl}/sign-for-issue`, {
         method: "POST",
         headers: signHeaders,
         body: JSON.stringify({
@@ -3256,7 +3257,7 @@ export function issueRoutes(
           ...(issuanceReq.options ?? {}),
           ...(approvalTicket ? { approvalTicket } : {}),
         }),
-      });
+      }, { label: "jit-ssh-token" });
 
       if (!signRes.ok) {
         const errorBody = await signRes.text().catch(() => "");
