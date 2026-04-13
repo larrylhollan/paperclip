@@ -192,6 +192,7 @@ interface IssuesListProps {
   createIssueLabel?: string;
   enableRoutineVisibilityFilter?: boolean;
   onSearchChange?: (search: string) => void;
+  onViewStatusChange?: (statuses: string[]) => void;
   onUpdateIssue: (id: string, data: Record<string, unknown>) => void;
 }
 
@@ -274,6 +275,7 @@ export function IssuesList({
   createIssueLabel,
   enableRoutineVisibilityFilter = false,
   onSearchChange,
+  onViewStatusChange,
   onUpdateIssue,
 }: IssuesListProps) {
   const { selectedCompanyId } = useCompany();
@@ -324,6 +326,20 @@ export function IssuesList({
       setVisibleIssueColumns(loadIssueColumns(scopedKey));
     }
   }, [scopedKey]);
+  // Notify parent of status filter changes so the API query can be scoped server-side.
+  const onViewStatusChangeRef = useRef(onViewStatusChange);
+  useEffect(() => { onViewStatusChangeRef.current = onViewStatusChange; });
+  const statusFilterKey = viewState.statuses.join(",");
+  useEffect(() => {
+    onViewStatusChangeRef.current?.(viewState.statuses);
+  }, [statusFilterKey]);
+
+  const handleIssueSearchCommit = useCallback((nextSearch: string) => {
+    startTransition(() => {
+      setIssueSearch(nextSearch);
+    });
+    onSearchChange?.(nextSearch);
+  }, [onSearchChange]);
 
   const updateView = useCallback((patch: Partial<IssueViewState>) => {
     setViewState((prev) => {

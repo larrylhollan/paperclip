@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
+import { createHmac, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fetchWithRetry } from "../jit-fetch-retry.js";
 import multer from "multer";
@@ -71,6 +72,7 @@ import {
 } from "../services/issue-execution-policy.js";
 import { syncJitPreApprovals } from "../services/jit-requirements-parser.js";
 import { revokeCredentialsOnIssueClose } from "../services/jit-credential-revocation.js";
+import { sendExecTokenApprovalNotification } from "../services/jit-notification.js";
 import { getJitTarget, listJitTargets, loadJitTargetRegistry, jitIssuanceRequestSchema } from "../jit-target-registry.js";
 import { createIssuanceId, storeIssuance, resolveIssuance, initIssuanceStore } from "../jit-issuance-store.js";
 import { computeJitApprovalHash } from "../jit-approval-hash.js";
@@ -3349,6 +3351,228 @@ export function issueRoutes(
       logger.error({ err, issueId: id }, "JIT SSH token provisioning failed");
       res.status(502).json({ error: "Failed to reach agent-access service" });
     }
+  });
+
+  // ── JIT exec token provisioning (two-phase approval flow) ──────────
+  // All exec token requests require Telegram approval — no auto-approve.
+  // Phase A (no approvalId): creates a pending approval, sends Telegram
+  //   notification, returns 202.
+  // Phase B (with approvalId): validates the approved approval, signs the
+  //   JWT, stores issuance, posts comment, and wakes the agent.
+
+  function signExecJwt(claims: object, secret: string): string {
+    const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+    const payload = Buffer.from(JSON.stringify(claims)).toString("base64url");
+    const signature = createHmac("sha256", secret).update(`${header}.${payload}`).digest("base64url");
+    return `${header}.${payload}.${signature}`;
+  }
+
+  router.post("/issues/:id/jit-exec-token", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+
+    // Board users and assignee agents may request exec tokens.
+    const isAssigneeAgent =
+      req.actor.type === "agent" &&
+      req.actor.agentId != null &&
+      issue.assigneeAgentId === req.actor.agentId;
+
+    if (req.actor.type !== "board" && !isAssigneeAgent) {
+      res.status(403).json({ error: "Only board users or the assigned agent can request JIT exec tokens" });
+      return;
+    }
+
+    const { target, scopes } = req.body as { target?: string; scopes?: string[] };
+    if (!target || typeof target !== "string") {
+      res.status(400).json({ error: "Missing required field: target" });
+      return;
+    }
+
+    const validScopes = scopes && Array.isArray(scopes) ? scopes : ["exec", "exec:script", "exec:stream"];
+
+    // ── Phase A: Request approval ──────────────────────────────────
+    const approvalId = req.body.approvalId as string | undefined;
+    if (!approvalId) {
+      const actor = getActorInfo(req);
+      const approval = await approvalsSvc.create(issue.companyId, {
+        type: "jit_exec_token",
+        requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
+        requestedByAgentId: actor.actorType === "agent" ? actor.actorId : null,
+        payload: {
+          issueId: id,
+          target,
+          scopes: validScopes,
+          assigneeAgentId: issue.assigneeAgentId ?? null,
+        },
+      });
+      await issueApprovalsSvc.link(id, approval.id, {
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      });
+
+      // Look up agent name for the notification
+      let agentName: string | undefined;
+      if (isAssigneeAgent && req.actor.agentId) {
+        const agent = await agentsSvc.getById(req.actor.agentId);
+        agentName = agent?.name ?? undefined;
+      }
+
+      // Send Telegram notification — no auto-approve for exec tokens
+      void sendExecTokenApprovalNotification({
+        approvalId: approval.id,
+        issueIdentifier: issue.identifier ?? undefined,
+        issueTitle: issue.title,
+        target,
+        scopes: validScopes,
+        agentName,
+        agentId: isAssigneeAgent ? req.actor.agentId! : undefined,
+      });
+
+      res.status(202).json({
+        status: "pending_approval",
+        approvalId: approval.id,
+      });
+      return;
+    }
+
+    // ── Phase B: Execute after approval ────────────────────────────
+    const approval = await approvalsSvc.getById(approvalId);
+    if (!approval) {
+      res.status(404).json({ error: "Approval not found" });
+      return;
+    }
+
+    if (approval.type !== "jit_exec_token") {
+      res.status(409).json({ error: "Approval is not a JIT exec token approval" });
+      return;
+    }
+
+    if (approval.status !== "approved") {
+      res.status(409).json({ error: `Approval is not approved (current status: ${approval.status})` });
+      return;
+    }
+
+    const approvalPayload = approval.payload as Record<string, unknown>;
+    if (approvalPayload.consumedAt) {
+      res.status(409).json({ error: "Approval has already been consumed" });
+      return;
+    }
+
+    if (approval.decidedAt) {
+      const decidedAtMs = new Date(approval.decidedAt).getTime();
+      const expiresAtMs = decidedAtMs + JIT_APPROVAL_TTL_MINUTES * 60 * 1000;
+      if (Date.now() > expiresAtMs) {
+        res.status(409).json({ error: "Approval has expired" });
+        return;
+      }
+    }
+
+    const secret = process.env.REX_JWT_SECRET;
+    if (!secret) {
+      logger.error("REX_JWT_SECRET not configured — cannot issue exec tokens");
+      res.status(500).json({ error: "Exec token signing not configured" });
+      return;
+    }
+
+    const agentId = isAssigneeAgent ? req.actor.agentId! : (req.actor as any).userId ?? "board";
+    const now = Math.floor(Date.now() / 1000);
+    const ttlSeconds = 2 * 60 * 60; // 2 hours
+    const jti = randomUUID();
+    const expiresAt = new Date((now + ttlSeconds) * 1000).toISOString();
+
+    const claims = {
+      iss: "paperclip",
+      sub: `agent:${agentId}`,
+      aud: "rex-agent",
+      iat: now,
+      exp: now + ttlSeconds,
+      jti,
+      issue_id: id,
+      target,
+      scopes: validScopes,
+    };
+
+    const token = signExecJwt(claims, secret);
+
+    // Mark approval as consumed before storing issuance to prevent double-spend.
+    await db
+      .update(approvalsTable)
+      .set({ payload: { ...approvalPayload, consumedAt: new Date().toISOString() } })
+      .where(drizzleEq(approvalsTable.id, approvalId));
+
+    // Store issuance for tracking and revocation.
+    const issuanceId = createIssuanceId();
+    const ttlMs = ttlSeconds * 1000;
+    await storeIssuance(issuanceId, { type: "exec_token", jti, exp: claims.exp, target, agentId }, id, ttlMs);
+
+    // Post a metadata comment on the issue (NOT the token itself).
+    const commentPayload = {
+      type: "jit-exec-token",
+      issuance_id: issuanceId,
+      target,
+      scopes: validScopes,
+      expires_at: expiresAt,
+      issued_to: claims.sub,
+    };
+
+    const structuredComment = [
+      "<!-- jit-exec-token -->",
+      "```json",
+      JSON.stringify(commentPayload, null, 2),
+      "```",
+      "<!-- /jit-exec-token -->",
+    ].join("\n");
+
+    const actor = getActorInfo(req);
+    const comment = await svc.addComment(id, structuredComment, {
+      userId: actor.actorType === "user" ? actor.actorId : undefined,
+      agentId: actor.actorType === "agent" ? actor.actorId : undefined,
+    });
+
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issue.id,
+      details: {
+        commentId: comment.id,
+        bodySnippet: "jit-exec-token provisioned",
+        identifier: issue.identifier,
+        issueTitle: issue.title,
+      },
+    });
+
+    // Wake the assigned agent so it picks up the new credentials.
+    const assigneeId = issue.assigneeAgentId;
+    if (assigneeId) {
+      heartbeat
+        .wakeup(assigneeId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "jit_exec_token_provisioned",
+          payload: { issueId: id, commentId: comment.id, target },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: {
+            issueId: id,
+            taskId: id,
+            commentId: comment.id,
+            source: "issue.jit_exec_token",
+            wakeReason: "jit_exec_token_provisioned",
+          },
+        })
+        .catch((err) => logger.warn({ err, issueId: id, agentId: assigneeId }, "failed to wake agent after JIT exec token"));
+    }
+
+    res.status(201).json({ token, expiresAt, issuanceId });
   });
 
   // ── JIT issuance resolution ────────────────────────────────────────

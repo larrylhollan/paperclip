@@ -1,6 +1,7 @@
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
 import { jitPreApprovalService } from "../services/jit-pre-approvals.js";
+import { approvalService, heartbeatService } from "../services/index.js";
 import {
   getJitApprovalBotToken,
   getAllowedUserIds,
@@ -50,6 +51,8 @@ async function answerCallbackQuery(callbackQueryId: string, text: string): Promi
 export function jitTelegramWebhookRoutes(db: Db) {
   const router = Router();
   const svc = jitPreApprovalService(db);
+  const approvalsSvc = approvalService(db);
+  const heartbeat = heartbeatService(db);
 
   router.post("/telegram/jit-webhook", async (req, res) => {
     const update = req.body as TelegramUpdate;
@@ -69,8 +72,69 @@ export function jitTelegramWebhookRoutes(db: Db) {
       return;
     }
 
-    // Parse callback_data: "jit:approve:<id>" or "jit:reject:<id>"
     const data = cbq.data ?? "";
+
+    // ── Exec token approval callbacks ──────────────────────────────
+    const execMatch = data.match(/^jit:(approve-exec|reject-exec):(.+)$/);
+    if (execMatch) {
+      const action = execMatch[1] === "approve-exec" ? "approve" : "reject";
+      const execApprovalId = execMatch[2];
+
+      try {
+        const decisionNote = `Telegram callback by user ${telegramUserId}`;
+        if (action === "approve") {
+          await approvalsSvc.approve(execApprovalId, `telegram:${telegramUserId}`, decisionNote);
+        } else {
+          await approvalsSvc.reject(execApprovalId, `telegram:${telegramUserId}`, decisionNote);
+        }
+
+        const emoji = action === "approve" ? "✅" : "❌";
+        const verb = action === "approve" ? "Approved" : "Rejected";
+        await answerCallbackQuery(cbq.id, `${emoji} Exec token ${verb}!`);
+
+        // Wake the requesting agent so it retries with the approvalId.
+        if (action === "approve") {
+          try {
+            const execApproval = await approvalsSvc.getById(execApprovalId);
+            const payload = execApproval?.payload as Record<string, unknown> | undefined;
+            const assigneeAgentId = typeof payload?.assigneeAgentId === "string" ? payload.assigneeAgentId : null;
+            const agentToWake = typeof payload?.requestedByAgentId === "string"
+              ? payload.requestedByAgentId
+              : (assigneeAgentId ?? (typeof execApproval?.requestedByAgentId === "string" ? execApproval.requestedByAgentId : null));
+            const issueId = typeof payload?.issueId === "string" ? payload.issueId : undefined;
+            if (agentToWake) {
+              void heartbeat.wakeup(agentToWake, {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "jit_exec_token_approved",
+                payload: { approvalId: execApprovalId, issueId, target: payload?.target },
+                contextSnapshot: issueId
+                  ? { issueId, taskId: issueId, source: "jit_exec_token_approved", wakeReason: "jit_exec_token_approved" }
+                  : undefined,
+              }).catch((err) => logger.warn({ err, approvalId: execApprovalId }, "failed to wake agent after exec token approval"));
+            }
+          } catch (err) {
+            logger.warn({ err, approvalId: execApprovalId }, "failed to look up approval for agent wake");
+          }
+        }
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (errMsg.includes("pending") || errMsg.includes("already")) {
+          await answerCallbackQuery(cbq.id, "ℹ️ Already processed");
+        } else if (errMsg.includes("not found")) {
+          await answerCallbackQuery(cbq.id, "❓ Not found");
+        } else {
+          logger.error({ err, approvalId: execApprovalId, action }, "JIT exec token webhook callback failed");
+          await answerCallbackQuery(cbq.id, "❌ Error processing action");
+        }
+      }
+
+      res.status(200).json({ ok: true });
+      return;
+    }
+
+    // ── SSH pre-approval callbacks ─────────────────────────────────
+    // Parse callback_data: "jit:approve:<id>" or "jit:reject:<id>"
     const match = data.match(/^jit:(approve|reject):(.+)$/);
     if (!match) {
       await answerCallbackQuery(cbq.id, "Unknown action");
@@ -88,11 +152,6 @@ export function jitTelegramWebhookRoutes(db: Db) {
       const emoji = status === "approved" ? "✅" : "❌";
       const verb = status === "approved" ? "Approved" : "Rejected";
       await answerCallbackQuery(cbq.id, `${emoji} ${verb}!`);
-
-      // With callback_query buttons, do NOT edit the keyboard.
-      // Each button press is independent — Telegram handles the UI.
-      // The buttons stay on the message, and re-tapping an already-processed
-      // one returns "Already processed" via answerCallbackQuery above.
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (errMsg.includes("Only pending")) {

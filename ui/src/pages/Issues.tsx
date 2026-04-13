@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useCallback } from "react";
+import { useEffect, useMemo, useCallback, useState } from "react";
 import { useLocation, useSearchParams } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { issuesApi } from "../api/issues";
@@ -25,6 +25,20 @@ export function buildIssuesSearchUrl(currentHref: string, search: string): strin
   }
 
   return `${url.pathname}${url.search}${url.hash}`;
+const DEFAULT_ACTIVE_STATUS = "backlog,todo,in_progress,in_review,blocked";
+
+function readPersistedStatusFilter(companyId: string | null): string | undefined {
+  if (!companyId) return DEFAULT_ACTIVE_STATUS;
+  try {
+    const raw = localStorage.getItem(`paperclip:issues-view:${companyId}`);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed.statuses)) {
+        return parsed.statuses.length > 0 ? parsed.statuses.join(",") : undefined;
+      }
+    }
+  } catch {}
+  return DEFAULT_ACTIVE_STATUS;
 }
 
 export function Issues() {
@@ -36,6 +50,15 @@ export function Issues() {
 
   const initialSearch = searchParams.get("q") ?? "";
   const participantAgentId = searchParams.get("participantAgentId") ?? undefined;
+  const initialAssignees = searchParams.get("assignee") ? [searchParams.get("assignee")!] : undefined;
+
+  const [apiStatusFilter, setApiStatusFilter] = useState<string | undefined>(() =>
+    initialAssignees ? undefined : readPersistedStatusFilter(selectedCompanyId ?? null)
+  );
+
+  const handleViewStatusChange = useCallback((statuses: string[]) => {
+    setApiStatusFilter(statuses.length > 0 ? statuses.join(",") : undefined);
+  }, []);
   const handleSearchChange = useCallback((search: string) => {
     const nextUrl = buildIssuesSearchUrl(window.location.href, search);
     if (!nextUrl) return;
@@ -91,6 +114,8 @@ export function Issues() {
       "with-routine-executions",
     ],
     queryFn: () => issuesApi.list(selectedCompanyId!, { participantAgentId, includeRoutineExecutions: true }),
+    queryKey: [...queryKeys.issues.list(selectedCompanyId!), "participant-agent", participantAgentId ?? "__all__", "status", apiStatusFilter ?? "__all__"],
+    queryFn: () => issuesApi.list(selectedCompanyId!, { participantAgentId, status: apiStatusFilter }),
     enabled: !!selectedCompanyId,
   });
 
@@ -116,10 +141,11 @@ export function Issues() {
       liveIssueIds={liveIssueIds}
       viewStateKey="paperclip:issues-view"
       issueLinkState={issueLinkState}
-      initialAssignees={searchParams.get("assignee") ? [searchParams.get("assignee")!] : undefined}
+      initialAssignees={initialAssignees}
       initialSearch={initialSearch}
       onSearchChange={handleSearchChange}
       enableRoutineVisibilityFilter
+      onViewStatusChange={handleViewStatusChange}
       onUpdateIssue={(id, data) => updateIssue.mutate({ id, data })}
       searchFilters={participantAgentId ? { participantAgentId } : undefined}
     />

@@ -32,6 +32,7 @@ import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { jitPreApprovalRoutes, jitQuickActionRoutes } from "./routes/jit-pre-approvals.js";
 import { jitTelegramWebhookRoutes } from "./routes/jit-telegram-webhook.js";
+import { jitExecTokenRoutes } from "./routes/jit-exec-token.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { adapterRoutes } from "./routes/adapters.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
@@ -217,6 +218,7 @@ export async function createApp(
   api.use(inboxDismissalRoutes(db));
   api.use(instanceSettingsRoutes(db));
   api.use(jitPreApprovalRoutes(db));
+  api.use(jitExecTokenRoutes(db));
   const hostServicesDisposers = new Map<string, () => void>();
   const workerManager = createPluginWorkerManager();
   const pluginRegistry = pluginRegistryService(db);

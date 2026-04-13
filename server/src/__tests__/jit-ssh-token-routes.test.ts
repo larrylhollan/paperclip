@@ -362,6 +362,74 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
     expect(body.target).toBe("pc.int");
   });
 
+  it("accepts 'role' as an alias for 'principal' (HOL-1456)", async () => {
+    // When the client sends { role: "agent-admin" } instead of { principal: "agent-admin" },
+    // the schema should transform it so the issuer receives principal=agent-admin.
+    const sendBody = { target: "pc.int", role: "agent-admin" };
+    const issue = makeIssue();
+    const paramsHash = computeJitApprovalHash({
+      issueId: ISSUE_ID,
+      target: "pc.int",
+      principal: "agent-admin",
+      ttlMinutes: 60,
+      assigneeAgentId: issue.assigneeAgentId,
+    });
+
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-role-alias" });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => TOKEN_RESPONSE,
+    });
+
+    await autoApproveAndExecute(app, sendBody, {
+      payload: {
+        issueId: ISSUE_ID,
+        target: "pc.int",
+        principal: "agent-admin",
+        ttlMinutes: 60,
+        assigneeAgentId: issue.assigneeAgentId,
+        paramsHash,
+        options: {},
+      },
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.principal).toBe("agent-admin");
+  });
+
+  it("'principal' takes precedence over 'role' when both are provided (HOL-1456)", async () => {
+    const sendBody = { target: "pc.int", principal: "agent-read", role: "agent-admin" };
+    const issue = makeIssue();
+    const paramsHash = computeJitApprovalHash({
+      issueId: ISSUE_ID,
+      target: "pc.int",
+      principal: "agent-read",
+      ttlMinutes: 60,
+      assigneeAgentId: issue.assigneeAgentId,
+    });
+
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-principal-wins" });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => TOKEN_RESPONSE,
+    });
+
+    await autoApproveAndExecute(app, sendBody, {
+      payload: {
+        issueId: ISSUE_ID,
+        target: "pc.int",
+        principal: "agent-read",
+        ttlMinutes: 60,
+        assigneeAgentId: issue.assigneeAgentId,
+        paramsHash,
+        options: {},
+      },
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.principal).toBe("agent-read");
+  });
+
   it("includes the configured bearer token when calling the issuer", async () => {
     process.env.AGENT_ACCESS_BEARER_TOKEN = "secret-token";
     mockIssueService.addComment.mockResolvedValue({ id: "comment-auth" });

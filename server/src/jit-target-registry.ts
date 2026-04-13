@@ -34,11 +34,17 @@ export const jitIssuanceRequestSchema = z.object({
   target: z.string().min(1),
   /** SSH principal / permission set. Falls back to target default. */
   principal: z.string().min(1).optional(),
+  /** Alias for principal (accepted for backward compatibility). */
+  role: z.string().min(1).optional(),
   /** Certificate TTL in minutes. Falls back to target default. */
   ttlMinutes: z.number().int().positive().max(1440).optional(),
   /** Arbitrary per-target options forwarded to the issuer. */
   options: z.record(z.unknown()).optional(),
-});
+}).transform(({ role, ...rest }) => ({
+  ...rest,
+  // "principal" takes precedence; "role" is a convenience alias.
+  principal: rest.principal ?? role,
+}));
 
 export type JitIssuanceRequest = z.infer<typeof jitIssuanceRequestSchema>;
 

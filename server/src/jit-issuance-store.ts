@@ -117,8 +117,13 @@ function _resolveFromMemory(issuanceId: string): IssuanceEntry | null {
   return entry;
 }
 
-export async function revokeIssuancesForIssue(issueId: string): Promise<number> {
-  if (!_db) return 0;
+export type RevokedIssuance = {
+  id: string;
+  payload: Record<string, unknown>;
+};
+
+export async function revokeIssuancesForIssue(issueId: string): Promise<{ count: number; revoked: RevokedIssuance[] }> {
+  if (!_db) return { count: 0, revoked: [] };
   const now = new Date();
   const result = await _db
     .update(jitIssuances)
@@ -130,7 +135,10 @@ export async function revokeIssuancesForIssue(issueId: string): Promise<number> 
       ),
     )
     .returning();
-  return result.length;
+  return {
+    count: result.length,
+    revoked: result.map((r) => ({ id: r.id, payload: r.payload as Record<string, unknown> })),
+  };
 }
 
 /** Visible for testing. Resets in-memory store and DB reference. */

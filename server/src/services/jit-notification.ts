@@ -534,3 +534,56 @@ export async function editAfterQuickAction(
     logger.warn({ err, preApprovalId }, "Failed to edit Telegram message after JIT action");
   }
 }
+
+// ---------------------------------------------------------------------------
+// Exec token approval notifications
+// ---------------------------------------------------------------------------
+
+export interface ExecTokenApprovalNotificationParams {
+  approvalId: string;
+  issueIdentifier?: string;
+  issueTitle?: string;
+  target: string;
+  scopes: string[];
+  agentName?: string;
+  agentId?: string;
+  adhoc?: boolean;
+}
+
+/**
+ * Send a Telegram notification for an exec token approval request.
+ * Includes Approve/Reject inline keyboard buttons using the dedicated JIT bot.
+ */
+export async function sendExecTokenApprovalNotification(
+  params: ExecTokenApprovalNotificationParams,
+): Promise<number | null> {
+  const { chatId } = getConfig();
+  if (!chatId) {
+    logger.debug("Exec token approval notification skipped: JIT_TELEGRAM_CHAT_ID not set");
+    return null;
+  }
+
+  const lines = [`🔐 <b>JIT Exec Token Request</b>`];
+  if (params.issueIdentifier && params.issueTitle) {
+    lines.push(`<b>${escapeHtml(params.issueIdentifier)}</b>: ${escapeHtml(params.issueTitle)}`);
+  } else if (params.adhoc) {
+    lines.push(`<i>Ad-hoc request (no issue)</i>`);
+  }
+  lines.push(`  → Target: <b>${escapeHtml(params.target)}</b>`);
+  lines.push(`  → Scopes: ${escapeHtml(params.scopes.join(", "))}`);
+  if (params.agentName) {
+    lines.push(`  → Agent: ${escapeHtml(params.agentName)}`);
+  } else if (params.agentId) {
+    lines.push(`  → Agent ID: ${escapeHtml(params.agentId)}`);
+  }
+
+  const text = lines.join("\n");
+  const keyboard = [
+    [
+      { text: "✅ Approve", callback_data: `jit:approve-exec:${params.approvalId}` },
+      { text: "❌ Reject", callback_data: `jit:reject-exec:${params.approvalId}` },
+    ],
+  ];
+
+  return sendJitMessage(text, { inline_keyboard: keyboard });
+}
