@@ -152,7 +152,7 @@ type SignerResponse = {
 /**
  * Call the SSH CA signer and store the issuance. Returns credential fields
  * to merge into the API response, or null if credential generation fails
- * (caller should still return the DB record).
+ * (caller should return HTTP 502 so the client can retry).
  */
 async function issueCredentialForPreApproval(
   target: string,
@@ -312,27 +312,76 @@ export function jitPreApprovalRoutes(db: Db) {
   // Exchange an approved pre-approval for credential tracking + SSH creds
   router.post("/jit-pre-approvals/:id/exchange", validate(exchangeJitPreApprovalSchema), async (req, res) => {
     const id = req.params.id as string;
-    const record = await svc.exchange(id, req.body.runId);
 
-    // Best-effort credential generation — never block the exchange
-    const ttlMinutes = getJitTarget(record.target)?.defaultTtlMinutes ?? 120;
+    const preApproval = await svc.getById(id);
+    if (!preApproval) {
+      res.status(404).json({ error: "Pre-approval not found" });
+      return;
+    }
+    if (preApproval.status !== "approved") {
+      res.status(409).json({ error: "Only approved pre-approvals can be exchanged" });
+      return;
+    }
+
+    // Generate credentials BEFORE flipping status — if this fails the
+    // pre-approval stays "approved" so the client can retry.
+    const ttlMinutes = getJitTarget(preApproval.target)?.defaultTtlMinutes ?? 120;
     let creds: Record<string, unknown> | null = null;
     try {
-      creds = await issueCredentialForPreApproval(record.target, record.role, record.issueId, ttlMinutes, {
-        id: record.id,
-        approvedByUserId: record.approvedByUserId,
-        approvedAt: record.approvedAt,
+      creds = await issueCredentialForPreApproval(preApproval.target, preApproval.role, preApproval.issueId, ttlMinutes, {
+        id: preApproval.id,
+        approvedByUserId: preApproval.approvedByUserId,
+        approvedAt: preApproval.approvedAt,
       });
     } catch (err) {
       logger.error({ err, id }, "pre-approval exchange: credential generation failed");
     }
 
-    res.json(creds ? { ...record, ...creds } : record);
+    if (!creds) {
+      res.status(502).json({ error: "Credential generation failed", retryable: true });
+      return;
+    }
+
+    const record = await svc.exchange(id, req.body.runId);
+    res.json({ ...record, ...creds });
   });
 
   // Renew an exchanged pre-approval credential
   router.post("/jit-pre-approvals/:id/renew", async (req, res) => {
     const id = req.params.id as string;
+
+    const preApproval = await svc.getById(id);
+    if (!preApproval) {
+      res.status(404).json({ error: "Pre-approval not found" });
+      return;
+    }
+    if (preApproval.status !== "exchanged") {
+      res.status(409).json({ error: "Only exchanged pre-approvals can be renewed" });
+      return;
+    }
+    if ((preApproval.renewalCount ?? 0) >= 1) {
+      res.status(409).json({ error: "Renewal budget exhausted" });
+      return;
+    }
+
+    // Generate credentials BEFORE flipping renewal count
+    const ttlMinutes = getJitTarget(preApproval.target)?.defaultTtlMinutes ?? 120;
+    let creds: Record<string, unknown> | null = null;
+    try {
+      creds = await issueCredentialForPreApproval(preApproval.target, preApproval.role, preApproval.issueId, ttlMinutes, {
+        id: preApproval.id,
+        approvedByUserId: preApproval.approvedByUserId,
+        approvedAt: preApproval.approvedAt,
+      });
+    } catch (err) {
+      logger.error({ err, id }, "pre-approval renew: credential generation failed");
+    }
+
+    if (!creds) {
+      res.status(502).json({ error: "Credential generation failed", retryable: true });
+      return;
+    }
+
     const record = await svc.renew(id);
 
     // Fire-and-forget renewal notification
@@ -344,20 +393,7 @@ export function jitPreApprovalRoutes(db: Db) {
       logger.debug({ err, id }, "Could not send renewal notification");
     }
 
-    // Best-effort credential generation — never block the renew
-    const ttlMinutes = getJitTarget(record.target)?.defaultTtlMinutes ?? 120;
-    let creds: Record<string, unknown> | null = null;
-    try {
-      creds = await issueCredentialForPreApproval(record.target, record.role, record.issueId, ttlMinutes, {
-        id: record.id,
-        approvedByUserId: record.approvedByUserId,
-        approvedAt: record.approvedAt,
-      });
-    } catch (err) {
-      logger.error({ err, id }, "pre-approval renew: credential generation failed");
-    }
-
-    res.json(creds ? { ...record, ...creds } : record);
+    res.json({ ...record, ...creds });
   });
 
   return router;

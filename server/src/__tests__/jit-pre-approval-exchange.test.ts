@@ -170,6 +170,9 @@ describe("POST /issues/:id/jit-pre-approvals", () => {
 
 describe("POST /jit-pre-approvals/:id/exchange", () => {
   it("returns credential fields when sign-for-issue succeeds", async () => {
+    // getById returns the approved record for pre-flight validation
+    mockPreApprovalService.getById.mockResolvedValue(RECORD_APPROVED);
+    // exchange flips status after creds succeed
     mockPreApprovalService.exchange.mockResolvedValue(RECORD_EXCHANGED);
     mockFetch.mockResolvedValue({
       ok: true,
@@ -203,10 +206,13 @@ describe("POST /jit-pre-approvals/:id/exchange", () => {
     expect(body.principal).toBe("agent");
     expect(body.issueId).toBe("issue-1");
     expect(opts.headers.Authorization).toBe("Bearer test-token");
+
+    // Verify exchange was called (status flipped AFTER creds)
+    expect(mockPreApprovalService.exchange).toHaveBeenCalledWith("aaaa-bbbb", "run-1");
   });
 
-  it("returns DB record without credentials when sign-for-issue fails", async () => {
-    mockPreApprovalService.exchange.mockResolvedValue(RECORD_EXCHANGED);
+  it("returns 502 and does not flip status when sign-for-issue fails", async () => {
+    mockPreApprovalService.getById.mockResolvedValue(RECORD_APPROVED);
     mockFetch.mockResolvedValue({
       ok: false,
       status: 500,
@@ -217,49 +223,77 @@ describe("POST /jit-pre-approvals/:id/exchange", () => {
     const res = await request(app)
       .post("/jit-pre-approvals/aaaa-bbbb/exchange")
       .send({ runId: "run-1" })
-      .expect(200);
+      .expect(502);
 
-    expect(res.body.status).toBe("exchanged");
-    expect(res.body.target).toBe("work.int");
-    expect(res.body.fetch_url).toBeUndefined();
-    expect(res.body.ssh_host).toBeUndefined();
+    expect(res.body.error).toBe("Credential generation failed");
+    expect(res.body.retryable).toBe(true);
+    // exchange must NOT have been called — status stays "approved"
+    expect(mockPreApprovalService.exchange).not.toHaveBeenCalled();
   });
 
-  it("returns DB record when target is not in registry", async () => {
+  it("returns 502 when target is not in registry", async () => {
     // Clear the registry so no targets are registered
     delete process.env.AGENT_ACCESS_BASE_URL;
     resetJitTargetRegistryCache();
 
-    const record = { ...RECORD_EXCHANGED, target: "unknown-host" };
-    mockPreApprovalService.exchange.mockResolvedValue(record);
+    const record = { ...RECORD_APPROVED, target: "unknown-host" };
+    mockPreApprovalService.getById.mockResolvedValue(record);
 
     const app = createApp();
     const res = await request(app)
       .post("/jit-pre-approvals/aaaa-bbbb/exchange")
       .send({ runId: "run-1" })
-      .expect(200);
+      .expect(502);
 
-    expect(res.body.status).toBe("exchanged");
-    expect(res.body.fetch_url).toBeUndefined();
+    expect(res.body.retryable).toBe(true);
     expect(mockFetch).not.toHaveBeenCalled();
+    expect(mockPreApprovalService.exchange).not.toHaveBeenCalled();
   });
 
-  it("returns DB record when fetch throws a network error", async () => {
-    mockPreApprovalService.exchange.mockResolvedValue(RECORD_EXCHANGED);
+  it("returns 502 when fetch throws a network error", async () => {
+    mockPreApprovalService.getById.mockResolvedValue(RECORD_APPROVED);
     mockFetch.mockRejectedValue(new Error("ECONNREFUSED"));
 
     const app = createApp();
     const res = await request(app)
       .post("/jit-pre-approvals/aaaa-bbbb/exchange")
       .send({ runId: "run-1" })
-      .expect(200);
+      .expect(502);
 
-    expect(res.body.status).toBe("exchanged");
-    expect(res.body.fetch_url).toBeUndefined();
+    expect(res.body.retryable).toBe(true);
+    expect(mockPreApprovalService.exchange).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when pre-approval does not exist", async () => {
+    mockPreApprovalService.getById.mockResolvedValue(null);
+
+    const app = createApp();
+    await request(app)
+      .post("/jit-pre-approvals/nonexistent/exchange")
+      .send({ runId: "run-1" })
+      .expect(404);
+
+    expect(mockPreApprovalService.exchange).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("returns 409 when pre-approval is not in approved status", async () => {
+    mockPreApprovalService.getById.mockResolvedValue(RECORD_EXCHANGED);
+
+    const app = createApp();
+    const res = await request(app)
+      .post("/jit-pre-approvals/aaaa-bbbb/exchange")
+      .send({ runId: "run-1" })
+      .expect(409);
+
+    expect(res.body.error).toMatch(/Only approved/);
+    expect(mockPreApprovalService.exchange).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it("includes approvalTicket in sign-for-issue when AGENT_ACCESS_TICKET_SECRET is set", async () => {
     process.env.AGENT_ACCESS_TICKET_SECRET = "test-ticket-secret";
+    mockPreApprovalService.getById.mockResolvedValue(RECORD_APPROVED);
     mockPreApprovalService.exchange.mockResolvedValue(RECORD_EXCHANGED);
     mockFetch.mockResolvedValue({
       ok: true,
@@ -288,6 +322,7 @@ describe("POST /jit-pre-approvals/:id/exchange", () => {
 
   it("does not include approvalTicket when AGENT_ACCESS_TICKET_SECRET is not set", async () => {
     delete process.env.AGENT_ACCESS_TICKET_SECRET;
+    mockPreApprovalService.getById.mockResolvedValue(RECORD_APPROVED);
     mockPreApprovalService.exchange.mockResolvedValue(RECORD_EXCHANGED);
     mockFetch.mockResolvedValue({
       ok: true,
@@ -309,6 +344,7 @@ describe("POST /jit-pre-approvals/:id/exchange", () => {
 
 describe("POST /jit-pre-approvals/:id/renew", () => {
   it("returns credential fields when sign-for-issue succeeds", async () => {
+    mockPreApprovalService.getById.mockResolvedValue(RECORD_EXCHANGED);
     mockPreApprovalService.renew.mockResolvedValue(RECORD_RENEWED);
     mockIssueService.getById.mockResolvedValue({ identifier: "ENG-42" });
     mockFetch.mockResolvedValue({
@@ -326,11 +362,13 @@ describe("POST /jit-pre-approvals/:id/renew", () => {
     expect(res.body.ssh_host).toBe(SIGNER_RESPONSE.ssh_host);
     expect(res.body.renewalCount).toBe(1);
     expect(res.body.status).toBe("exchanged");
+
+    // Verify renew was called AFTER credential generation
+    expect(mockPreApprovalService.renew).toHaveBeenCalledWith("aaaa-bbbb");
   });
 
-  it("returns DB record without credentials when sign-for-issue fails", async () => {
-    mockPreApprovalService.renew.mockResolvedValue(RECORD_RENEWED);
-    mockIssueService.getById.mockResolvedValue({ identifier: "ENG-42" });
+  it("returns 502 and does not bump renewal count when sign-for-issue fails", async () => {
+    mockPreApprovalService.getById.mockResolvedValue(RECORD_EXCHANGED);
     mockFetch.mockResolvedValue({
       ok: false,
       status: 502,
@@ -341,9 +379,49 @@ describe("POST /jit-pre-approvals/:id/renew", () => {
     const res = await request(app)
       .post("/jit-pre-approvals/aaaa-bbbb/renew")
       .send()
-      .expect(200);
+      .expect(502);
 
-    expect(res.body.renewalCount).toBe(1);
-    expect(res.body.fetch_url).toBeUndefined();
+    expect(res.body.error).toBe("Credential generation failed");
+    expect(res.body.retryable).toBe(true);
+    // renew must NOT have been called — renewal count stays at 0
+    expect(mockPreApprovalService.renew).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when pre-approval does not exist", async () => {
+    mockPreApprovalService.getById.mockResolvedValue(null);
+
+    const app = createApp();
+    await request(app)
+      .post("/jit-pre-approvals/nonexistent/renew")
+      .send()
+      .expect(404);
+
+    expect(mockPreApprovalService.renew).not.toHaveBeenCalled();
+  });
+
+  it("returns 409 when pre-approval is not in exchanged status", async () => {
+    mockPreApprovalService.getById.mockResolvedValue(RECORD_APPROVED);
+
+    const app = createApp();
+    const res = await request(app)
+      .post("/jit-pre-approvals/aaaa-bbbb/renew")
+      .send()
+      .expect(409);
+
+    expect(res.body.error).toMatch(/Only exchanged/);
+    expect(mockPreApprovalService.renew).not.toHaveBeenCalled();
+  });
+
+  it("returns 409 when renewal budget is exhausted", async () => {
+    mockPreApprovalService.getById.mockResolvedValue(RECORD_RENEWED);
+
+    const app = createApp();
+    const res = await request(app)
+      .post("/jit-pre-approvals/aaaa-bbbb/renew")
+      .send()
+      .expect(409);
+
+    expect(res.body.error).toMatch(/exhausted|already been renewed/);
+    expect(mockPreApprovalService.renew).not.toHaveBeenCalled();
   });
 });
