@@ -30,11 +30,14 @@ vi.mock("../services/issues.js", () => ({
   issueService: () => mockIssueService,
 }));
 
+const mockQueueJitNotification = vi.hoisted(() => vi.fn());
+
 vi.mock("../services/jit-notification.js", () => ({
   sendRenewalNotification: vi.fn(async () => undefined),
   verifyAction: vi.fn(),
   getHmacSecret: vi.fn(),
   editAfterQuickAction: vi.fn(async () => undefined),
+  queueJitNotification: mockQueueJitNotification,
 }));
 
 // ── Mock global fetch ───────────────────────────────────────────────
@@ -44,7 +47,7 @@ vi.stubGlobal("fetch", mockFetch);
 
 // ── Mock auth middleware ─────────────────────────────────────────────
 
-vi.mock("./authz.js", () => ({
+vi.mock("../routes/authz.js", () => ({
   assertBoard: vi.fn(),
   assertCompanyAccess: vi.fn(),
 }));
@@ -122,6 +125,48 @@ afterEach(() => {
 });
 
 // ── Tests ────────────────────────────────────────────────────────────
+
+describe("POST /issues/:id/jit-pre-approvals", () => {
+  const ISSUE = {
+    id: "issue-1",
+    identifier: "ENG-100",
+    title: "Test issue",
+    parentId: null,
+    companyId: "company-1",
+  };
+
+  const CREATED_RECORDS = [
+    { id: "rec-1", issueId: "issue-1", target: "work.int", role: "agent", reason: "deploy", status: "pending" },
+  ];
+
+  it("calls queueJitNotification after creating records", async () => {
+    mockIssueService.getById.mockResolvedValue(ISSUE);
+    mockPreApprovalService.createForIssue.mockResolvedValue(CREATED_RECORDS);
+
+    const app = createApp();
+    const res = await request(app)
+      .post("/issues/issue-1/jit-pre-approvals")
+      .send({ records: [{ target: "work.int", role: "agent", reason: "deploy" }] })
+      .expect(201);
+
+    expect(res.body).toEqual(CREATED_RECORDS);
+    expect(mockQueueJitNotification).toHaveBeenCalledOnce();
+    expect(mockQueueJitNotification).toHaveBeenCalledWith({}, ISSUE, CREATED_RECORDS);
+  });
+
+  it("returns 404 and does not notify when issue is not found", async () => {
+    mockIssueService.getById.mockResolvedValue(null);
+
+    const app = createApp();
+    await request(app)
+      .post("/issues/missing/jit-pre-approvals")
+      .send({ records: [{ target: "work.int", role: "agent", reason: "deploy" }] })
+      .expect(404);
+
+    expect(mockQueueJitNotification).not.toHaveBeenCalled();
+    expect(mockPreApprovalService.createForIssue).not.toHaveBeenCalled();
+  });
+});
 
 describe("POST /jit-pre-approvals/:id/exchange", () => {
   it("returns credential fields when sign-for-issue succeeds", async () => {

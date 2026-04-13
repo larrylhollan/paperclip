@@ -16,6 +16,7 @@ import {
   getHmacSecret,
   editAfterQuickAction,
   sendRenewalNotification,
+  queueJitNotification,
 } from "../services/jit-notification.js";
 import { logger } from "../middleware/logger.js";
 import { getJitTarget } from "../jit-target-registry.js";
@@ -282,6 +283,7 @@ export function jitPreApprovalRoutes(db: Db) {
     }
     assertCompanyAccess(req, issue.companyId);
     const records = await svc.createForIssue(issue.id, req.body.records);
+    queueJitNotification(db, issue, records);
     res.status(201).json(records);
   });
 
