@@ -1,7 +1,7 @@
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
 import { jitPreApprovalService } from "../services/jit-pre-approvals.js";
-import { approvalService, heartbeatService } from "../services/index.js";
+import { approvalService, heartbeatService, agentService, issueService } from "../services/index.js";
 import {
   getJitApprovalBotToken,
   getAllowedUserIds,
@@ -53,6 +53,8 @@ export function jitTelegramWebhookRoutes(db: Db) {
   const svc = jitPreApprovalService(db);
   const approvalsSvc = approvalService(db);
   const heartbeat = heartbeatService(db);
+  const agentsSvc = agentService(db);
+  const issuesSvc = issueService(db);
 
   router.post("/telegram/jit-webhook", async (req, res) => {
     const update = req.body as TelegramUpdate;
@@ -102,16 +104,75 @@ export function jitTelegramWebhookRoutes(db: Db) {
               ? payload.requestedByAgentId
               : (assigneeAgentId ?? (typeof execApproval?.requestedByAgentId === "string" ? execApproval.requestedByAgentId : null));
             const issueId = typeof payload?.issueId === "string" ? payload.issueId : undefined;
+            const originSessionKey = typeof payload?.originSessionKey === "string" ? payload.originSessionKey : null;
+            const originGatewayPort = typeof payload?.originGatewayPort === "number" ? payload.originGatewayPort : null;
+
+            // Post comment + unblock issue so Paperclip adapter picks it up
+            if (issueId) {
+              try {
+                const issue = await issuesSvc.getById(issueId);
+                const commentBody = `JIT exec token approved by telegram:${telegramUserId} for ${payload?.target ?? "unknown"}. Agent can now proceed.`;
+                await issuesSvc.addComment(issueId, commentBody, {});
+                if (issue?.status === "blocked") {
+                  await issuesSvc.update(issueId, { status: "todo" });
+                }
+              } catch (err) {
+                logger.warn({ err, approvalId: execApprovalId }, "failed to unblock issue after exec token approval");
+              }
+            }
+
             if (agentToWake) {
-              void heartbeat.wakeup(agentToWake, {
-                source: "automation",
-                triggerDetail: "system",
-                reason: "jit_exec_token_approved",
-                payload: { approvalId: execApprovalId, issueId, target: payload?.target },
-                contextSnapshot: issueId
-                  ? { issueId, taskId: issueId, source: "jit_exec_token_approved", wakeReason: "jit_exec_token_approved" }
-                  : undefined,
-              }).catch((err) => logger.warn({ err, approvalId: execApprovalId }, "failed to wake agent after exec token approval"));
+              // Try session-targeted wake via gateway API if origin session info is available
+              let sessionWakeSent = false;
+              if (originSessionKey && originGatewayPort) {
+                try {
+                  const agent = await agentsSvc.getById(agentToWake);
+                  const adapterConfig = agent?.adapterConfig as Record<string, unknown> | undefined;
+                  // authToken is a top-level field in adapterConfig for openclaw_gateway agents
+                  const gatewayToken = typeof adapterConfig?.authToken === "string" ? adapterConfig.authToken : null;
+
+                  if (gatewayToken && agent?.urlKey) {
+                    const wakeUrl = `http://127.0.0.1:${originGatewayPort}/v1/chat/completions`;
+                    const wakeBody = JSON.stringify({
+                      model: `openclaw/${agent.urlKey}`,
+                      messages: [{ role: "user", content: `JIT exec token approved for ${payload?.target ?? "unknown"} (approvalId: ${execApprovalId}). Retry your command.` }],
+                      stream: false,
+                    });
+
+                    const wakeResp = await fetch(wakeUrl, {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${gatewayToken}`,
+                        "x-openclaw-session-key": originSessionKey,
+                      },
+                      body: wakeBody,
+                      signal: AbortSignal.timeout(10_000),
+                    });
+                    sessionWakeSent = wakeResp.ok;
+                    if (!wakeResp.ok) {
+                      logger.warn({ status: wakeResp.status, approvalId: execApprovalId }, "session-targeted wake returned non-OK");
+                    } else {
+                      logger.info({ approvalId: execApprovalId, agentId: agentToWake }, "session-targeted wake sent via gateway");
+                    }
+                  }
+                } catch (err) {
+                  logger.warn({ err, approvalId: execApprovalId }, "session-targeted wake failed, falling back to heartbeat");
+                }
+              }
+
+              // Fall back to heartbeat wakeup if session wake wasn't sent
+              if (!sessionWakeSent) {
+                void heartbeat.wakeup(agentToWake, {
+                  source: "automation",
+                  triggerDetail: "system",
+                  reason: "jit_exec_token_approved",
+                  payload: { approvalId: execApprovalId, issueId, target: payload?.target },
+                  contextSnapshot: issueId
+                    ? { issueId, taskId: issueId, source: "jit_exec_token_approved", wakeReason: "jit_exec_token_approved" }
+                    : undefined,
+                }).catch((err) => logger.warn({ err, approvalId: execApprovalId }, "failed to wake agent after exec token approval"));
+              }
             }
           } catch (err) {
             logger.warn({ err, approvalId: execApprovalId }, "failed to look up approval for agent wake");
@@ -147,11 +208,45 @@ export function jitTelegramWebhookRoutes(db: Db) {
     const status = action === "approve" ? "approved" : "rejected";
 
     try {
-      await svc.updateStatus(preApprovalId, status, `telegram:${telegramUserId}`);
+      const updatedPreApproval = await svc.updateStatus(preApprovalId, status, `telegram:${telegramUserId}`);
 
       const emoji = status === "approved" ? "✅" : "❌";
       const verb = status === "approved" ? "Approved" : "Rejected";
       await answerCallbackQuery(cbq.id, `${emoji} ${verb}!`);
+
+      // After SSH pre-approval: post comment + unblock issue + wake agent
+      if (status === "approved" && updatedPreApproval?.issueId) {
+        try {
+          const issue = await issuesSvc.getById(updatedPreApproval.issueId);
+
+          // Post system comment so the adapter sees new activity
+          const commentBody = `JIT SSH pre-approval approved by telegram:${telegramUserId} for ${updatedPreApproval.target} (${updatedPreApproval.role}). Agent can now proceed.`;
+          await issuesSvc.addComment(updatedPreApproval.issueId, commentBody, {});
+
+          // Transition blocked → todo so Paperclip adapter picks it up for a new run
+          if (issue?.status === "blocked") {
+            await issuesSvc.update(updatedPreApproval.issueId, { status: "todo" });
+          }
+
+          // Wake the assigned agent via heartbeat
+          if (issue?.assigneeAgentId) {
+            void heartbeat.wakeup(issue.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "jit_pre_approval_approved",
+              payload: { preApprovalId, issueId: updatedPreApproval.issueId, target: updatedPreApproval.target },
+              contextSnapshot: {
+                issueId: updatedPreApproval.issueId,
+                taskId: updatedPreApproval.issueId,
+                source: "jit_pre_approval_approved",
+                wakeReason: "jit_pre_approval_approved",
+              },
+            }).catch((err) => logger.warn({ err, preApprovalId }, "failed to wake agent after SSH pre-approval"));
+          }
+        } catch (err) {
+          logger.warn({ err, preApprovalId }, "failed to unblock issue after SSH pre-approval");
+        }
+      }
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (errMsg.includes("Only pending")) {

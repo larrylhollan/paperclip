@@ -6,10 +6,37 @@ import { jitTelegramWebhookRoutes } from "../routes/jit-telegram-webhook.js";
 // ── Mock services ───────────────────────────────────────────────────
 
 const mockUpdateStatus = vi.fn();
+const mockGetById = vi.fn();
+const mockAddComment = vi.fn();
+const mockIssueUpdate = vi.fn();
+const mockWakeup = vi.fn();
+const mockApprove = vi.fn();
+const mockReject = vi.fn();
+const mockApprovalGetById = vi.fn();
+const mockAgentGetById = vi.fn();
 
 vi.mock("../services/jit-pre-approvals.js", () => ({
   jitPreApprovalService: () => ({
     updateStatus: mockUpdateStatus,
+  }),
+}));
+
+vi.mock("../services/index.js", () => ({
+  approvalService: () => ({
+    approve: mockApprove,
+    reject: mockReject,
+    getById: mockApprovalGetById,
+  }),
+  heartbeatService: () => ({
+    wakeup: mockWakeup,
+  }),
+  agentService: () => ({
+    getById: mockAgentGetById,
+  }),
+  issueService: () => ({
+    getById: mockGetById,
+    addComment: mockAddComment,
+    update: mockIssueUpdate,
   }),
 }));
 
@@ -41,6 +68,9 @@ beforeEach(() => {
     ok: true,
     json: async () => ({ ok: true }),
   });
+  mockWakeup.mockResolvedValue(undefined);
+  mockAddComment.mockResolvedValue({ id: "comment-1", body: "test" });
+  mockIssueUpdate.mockResolvedValue({ id: "issue-1", status: "todo" });
   // Set allowed user IDs via env before importing
   process.env.JIT_APPROVAL_ALLOWED_USER_IDS = "12345,67890";
 });
@@ -70,6 +100,13 @@ describe("POST /api/telegram/jit-webhook", () => {
       id: "pre-1",
       status: "approved",
       target: "work.int",
+      role: "agent-web",
+      issueId: "issue-1",
+    });
+    mockGetById.mockResolvedValue({
+      id: "issue-1",
+      status: "blocked",
+      assigneeAgentId: "agent-1",
     });
 
     const app = createApp();
@@ -82,11 +119,104 @@ describe("POST /api/telegram/jit-webhook", () => {
     expect(mockUpdateStatus).toHaveBeenCalledWith("pre-1", "approved", "telegram:12345");
 
     // Should have called answerCallbackQuery
-    expect(mockFetch).toHaveBeenCalledTimes(1);
-    const [url, opts] = mockFetch.mock.calls[0];
-    expect(url).toContain("/answerCallbackQuery");
-    const body = JSON.parse(opts.body);
+    const answerCalls = mockFetch.mock.calls.filter(([url]: [string]) => url.includes("/answerCallbackQuery"));
+    expect(answerCalls.length).toBe(1);
+    const body = JSON.parse(answerCalls[0][1].body);
     expect(body.text).toContain("Approved");
+  });
+
+  it("posts comment and unblocks issue on SSH pre-approval approve", async () => {
+    mockUpdateStatus.mockResolvedValue({
+      id: "pre-1",
+      status: "approved",
+      target: "work.int",
+      role: "agent-web",
+      issueId: "issue-1",
+    });
+    mockGetById.mockResolvedValue({
+      id: "issue-1",
+      status: "blocked",
+      assigneeAgentId: "agent-1",
+    });
+
+    const app = createApp();
+    await request(app)
+      .post("/api/telegram/jit-webhook")
+      .send(callbackUpdate(12345, "jit:approve:pre-1"))
+      .expect(200);
+
+    // Should have posted a comment
+    expect(mockAddComment).toHaveBeenCalledWith(
+      "issue-1",
+      expect.stringContaining("JIT SSH pre-approval approved"),
+      {},
+    );
+    expect(mockAddComment.mock.calls[0][1]).toContain("work.int");
+    expect(mockAddComment.mock.calls[0][1]).toContain("agent-web");
+
+    // Should have set status to todo
+    expect(mockIssueUpdate).toHaveBeenCalledWith("issue-1", { status: "todo" });
+
+    // Should have woken the assigned agent
+    expect(mockWakeup).toHaveBeenCalledWith("agent-1", expect.objectContaining({
+      reason: "jit_pre_approval_approved",
+      payload: expect.objectContaining({
+        preApprovalId: "pre-1",
+        issueId: "issue-1",
+        target: "work.int",
+      }),
+    }));
+  });
+
+  it("does not unblock issue if not in blocked status", async () => {
+    mockUpdateStatus.mockResolvedValue({
+      id: "pre-1",
+      status: "approved",
+      target: "work.int",
+      role: "agent-web",
+      issueId: "issue-1",
+    });
+    mockGetById.mockResolvedValue({
+      id: "issue-1",
+      status: "in_progress",
+      assigneeAgentId: "agent-1",
+    });
+
+    const app = createApp();
+    await request(app)
+      .post("/api/telegram/jit-webhook")
+      .send(callbackUpdate(12345, "jit:approve:pre-1"))
+      .expect(200);
+
+    // Comment should still be posted
+    expect(mockAddComment).toHaveBeenCalled();
+
+    // Should NOT transition status since it's not blocked
+    expect(mockIssueUpdate).not.toHaveBeenCalled();
+
+    // Should still wake the agent
+    expect(mockWakeup).toHaveBeenCalled();
+  });
+
+  it("does not post comment or wake on rejection", async () => {
+    mockUpdateStatus.mockResolvedValue({
+      id: "pre-2",
+      status: "rejected",
+      target: "work.int",
+      role: "agent-web",
+      issueId: "issue-1",
+    });
+
+    const app = createApp();
+    await request(app)
+      .post("/api/telegram/jit-webhook")
+      .send(callbackUpdate(67890, "jit:reject:pre-2"))
+      .expect(200);
+
+    expect(mockUpdateStatus).toHaveBeenCalledWith("pre-2", "rejected", "telegram:67890");
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(mockIssueUpdate).not.toHaveBeenCalled();
+    expect(mockWakeup).not.toHaveBeenCalled();
   });
 
   it("rejects a valid callback", async () => {
@@ -104,8 +234,8 @@ describe("POST /api/telegram/jit-webhook", () => {
 
     expect(mockUpdateStatus).toHaveBeenCalledWith("pre-2", "rejected", "telegram:67890");
 
-    const [, opts] = mockFetch.mock.calls[0];
-    const body = JSON.parse(opts.body);
+    const answerCalls = mockFetch.mock.calls.filter(([url]: [string]) => url.includes("/answerCallbackQuery"));
+    const body = JSON.parse(answerCalls[0][1].body);
     expect(body.text).toContain("Rejected");
   });
 
@@ -160,8 +290,8 @@ describe("POST /api/telegram/jit-webhook", () => {
       .send(callbackUpdate(12345, "jit:approve:pre-1"))
       .expect(200);
 
-    const [, opts] = mockFetch.mock.calls[0];
-    const body = JSON.parse(opts.body);
+    const answerCalls = mockFetch.mock.calls.filter(([url]: [string]) => url.includes("/answerCallbackQuery"));
+    const body = JSON.parse(answerCalls[0][1].body);
     expect(body.text).toContain("Already processed");
   });
 
@@ -174,8 +304,29 @@ describe("POST /api/telegram/jit-webhook", () => {
       .send(callbackUpdate(12345, "jit:approve:pre-1"))
       .expect(200);
 
-    const [, opts] = mockFetch.mock.calls[0];
-    const body = JSON.parse(opts.body);
+    const answerCalls = mockFetch.mock.calls.filter(([url]: [string]) => url.includes("/answerCallbackQuery"));
+    const body = JSON.parse(answerCalls[0][1].body);
     expect(body.text).toContain("Not found");
+  });
+
+  it("gracefully handles issue service failures during SSH approve", async () => {
+    mockUpdateStatus.mockResolvedValue({
+      id: "pre-1",
+      status: "approved",
+      target: "work.int",
+      role: "agent-web",
+      issueId: "issue-1",
+    });
+    mockGetById.mockRejectedValue(new Error("DB connection failed"));
+
+    const app = createApp();
+    const res = await request(app)
+      .post("/api/telegram/jit-webhook")
+      .send(callbackUpdate(12345, "jit:approve:pre-1"))
+      .expect(200);
+
+    // Approval still succeeds — the unblock failure is non-fatal
+    expect(res.body).toEqual({ ok: true });
+    expect(mockUpdateStatus).toHaveBeenCalledWith("pre-1", "approved", "telegram:12345");
   });
 });
