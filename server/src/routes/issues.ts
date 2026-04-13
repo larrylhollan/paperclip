@@ -3421,8 +3421,9 @@ export function issueRoutes(
         agentName = agent?.name ?? undefined;
       }
 
-      // Send Telegram notification — no auto-approve for exec tokens
-      void sendExecTokenApprovalNotification({
+      // Await notification delivery so we can surface failures to the caller.
+      // The agent polling loop depends on Jeff seeing this notification.
+      const notifResult = await sendExecTokenApprovalNotification({
         approvalId: approval.id,
         issueIdentifier: issue.identifier ?? undefined,
         issueTitle: issue.title,
@@ -3435,6 +3436,8 @@ export function issueRoutes(
       res.status(202).json({
         status: "pending_approval",
         approvalId: approval.id,
+        notificationDelivered: notifResult.sent,
+        ...(notifResult.sent ? {} : { notificationError: notifResult.reason }),
       });
       return;
     }

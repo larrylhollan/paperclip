@@ -150,7 +150,9 @@ export function jitExecTokenRoutes(db: Db) {
       agentName = agent?.name ?? undefined;
     }
 
-    void sendExecTokenApprovalNotification({
+    // Await notification delivery so we can surface failures to the caller.
+    // The agent polling loop depends on Jeff seeing this notification.
+    const notifResult = await sendExecTokenApprovalNotification({
       approvalId: approval.id,
       target,
       scopes: validScopes,
@@ -162,6 +164,8 @@ export function jitExecTokenRoutes(db: Db) {
     res.status(202).json({
       status: "pending_approval",
       approvalId: approval.id,
+      notificationDelivered: notifResult.sent,
+      ...(notifResult.sent ? {} : { notificationError: notifResult.reason }),
     });
   });
 

@@ -422,7 +422,7 @@ export function queueJitNotification(
 ): void {
   const { chatId } = getConfig();
   if (!chatId) {
-    logger.debug("JIT notification skipped: JIT_TELEGRAM_CHAT_ID not set");
+    logger.error("JIT notification FAILED: JIT_TELEGRAM_CHAT_ID not set — approval requests will be invisible");
     return;
   }
 
@@ -553,37 +553,64 @@ export interface ExecTokenApprovalNotificationParams {
 /**
  * Send a Telegram notification for an exec token approval request.
  * Includes Approve/Reject inline keyboard buttons using the dedicated JIT bot.
+ *
+ * Returns `{ sent: true, messageId }` on success or `{ sent: false, reason }` on failure.
+ * Never throws — all errors are caught and returned as failure results.
  */
 export async function sendExecTokenApprovalNotification(
   params: ExecTokenApprovalNotificationParams,
-): Promise<number | null> {
-  const { chatId } = getConfig();
-  if (!chatId) {
-    logger.debug("Exec token approval notification skipped: JIT_TELEGRAM_CHAT_ID not set");
-    return null;
-  }
+): Promise<{ sent: true; messageId: number } | { sent: false; reason: string }> {
+  try {
+    const { chatId } = getConfig();
+    if (!chatId) {
+      const reason = "JIT_TELEGRAM_CHAT_ID not set";
+      logger.error({ approvalId: params.approvalId }, `Exec token approval notification FAILED: ${reason}`);
+      return { sent: false, reason };
+    }
 
-  const lines = [`🔐 <b>JIT Exec Token Request</b>`];
-  if (params.issueIdentifier && params.issueTitle) {
-    lines.push(`<b>${escapeHtml(params.issueIdentifier)}</b>: ${escapeHtml(params.issueTitle)}`);
-  } else if (params.adhoc) {
-    lines.push(`<i>Ad-hoc request (no issue)</i>`);
-  }
-  lines.push(`  → Target: <b>${escapeHtml(params.target)}</b>`);
-  lines.push(`  → Scopes: ${escapeHtml(params.scopes.join(", "))}`);
-  if (params.agentName) {
-    lines.push(`  → Agent: ${escapeHtml(params.agentName)}`);
-  } else if (params.agentId) {
-    lines.push(`  → Agent ID: ${escapeHtml(params.agentId)}`);
-  }
+    const lines = [`🔐 <b>JIT Exec Token Request</b>`];
+    if (params.issueIdentifier && params.issueTitle) {
+      lines.push(`<b>${escapeHtml(params.issueIdentifier)}</b>: ${escapeHtml(params.issueTitle)}`);
+    } else if (params.adhoc) {
+      lines.push(`<i>Ad-hoc request (no issue)</i>`);
+    }
+    lines.push(`  → Target: <b>${escapeHtml(params.target)}</b>`);
+    lines.push(`  → Scopes: ${escapeHtml(params.scopes.join(", "))}`);
+    if (params.agentName) {
+      lines.push(`  → Agent: ${escapeHtml(params.agentName)}`);
+    } else if (params.agentId) {
+      lines.push(`  → Agent ID: ${escapeHtml(params.agentId)}`);
+    }
 
-  const text = lines.join("\n");
-  const keyboard = [
-    [
-      { text: "✅ Approve", callback_data: `jit:approve-exec:${params.approvalId}` },
-      { text: "❌ Reject", callback_data: `jit:reject-exec:${params.approvalId}` },
-    ],
-  ];
+    const text = lines.join("\n");
+    const keyboard = [
+      [
+        { text: "✅ Approve", callback_data: `jit:approve-exec:${params.approvalId}` },
+        { text: "❌ Reject", callback_data: `jit:reject-exec:${params.approvalId}` },
+      ],
+    ];
 
-  return sendJitMessage(text, { inline_keyboard: keyboard });
+    const messageId = await sendJitMessage(text, { inline_keyboard: keyboard });
+    if (messageId == null) {
+      const reason = "Telegram API returned no message ID (bot token missing or API error)";
+      logger.error(
+        { approvalId: params.approvalId, target: params.target, agentName: params.agentName },
+        `Exec token approval notification FAILED to deliver: ${reason}`,
+      );
+      return { sent: false, reason };
+    }
+
+    logger.info(
+      { approvalId: params.approvalId, messageId, target: params.target },
+      "Exec token approval notification sent",
+    );
+    return { sent: true, messageId };
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    logger.error(
+      { err, approvalId: params.approvalId, target: params.target },
+      `Exec token approval notification FAILED with exception: ${reason}`,
+    );
+    return { sent: false, reason };
+  }
 }

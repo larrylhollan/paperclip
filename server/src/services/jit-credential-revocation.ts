@@ -41,7 +41,7 @@ async function revokeExecTokensOnRexAgent(revoked: RevokedIssuance[]): Promise<v
           Authorization: `Bearer ${adminToken}`,
         },
         body: JSON.stringify({ jti: p.jti, exp: p.exp }),
-      }, { label: "rex-revoke", retries: 2 });
+      }, { label: "rex-revoke", maxRetries: 2 });
     } catch (err) {
       logger.warn({ err, jti: p.jti, issueId: entry.id }, "failed to revoke exec token on rex-agent");
     }

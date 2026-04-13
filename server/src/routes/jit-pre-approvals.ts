@@ -283,7 +283,7 @@ export function jitPreApprovalRoutes(db: Db) {
     }
     assertCompanyAccess(req, issue.companyId);
     const records = await svc.createForIssue(issue.id, req.body.records);
-    queueJitNotification(db, issue, records);
+    queueJitNotification(db, { ...issue, identifier: issue.identifier ?? issue.id.slice(0, 8) }, records);
     res.status(201).json(records);
   });
 
