@@ -281,7 +281,7 @@ export function jitPreApprovalRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    const records = await svc.createForIssue(issueId, req.body.records);
+    const records = await svc.createForIssue(issue.id, req.body.records);
     res.status(201).json(records);
   });
 
@@ -295,7 +295,7 @@ export function jitPreApprovalRoutes(db: Db) {
     }
     assertCompanyAccess(req, issue.companyId);
     const status = req.query.status as string | undefined;
-    const records = await svc.listForIssue(issueId, status);
+    const records = await svc.listForIssue(issue.id, status);
     res.json(records);
   });
 
