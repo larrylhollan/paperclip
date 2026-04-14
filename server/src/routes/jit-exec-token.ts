@@ -2,7 +2,7 @@ import { Router } from "express";
 import { createHmac, randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { approvals as approvalsTable } from "@paperclipai/db";
-import { eq as drizzleEq } from "drizzle-orm";
+import { and, eq as drizzleEq, sql } from "drizzle-orm";
 import {
   approvalService,
   agentService,
@@ -31,11 +31,13 @@ export function jitExecTokenRoutes(db: Db) {
   const agentsSvc = agentService(db);
 
   router.post("/jit-exec-token", async (req, res) => {
-    const { target, scopes, agentId: requestedAgentId, approvalId } = req.body as {
+    const { target, scopes, agentId: requestedAgentId, approvalId, originSessionKey, originGatewayPort } = req.body as {
       target?: string;
       scopes?: string[];
       agentId?: string;
       approvalId?: string;
+      originSessionKey?: string;
+      originGatewayPort?: number;
     };
 
     // Resolve companyId from actor context
@@ -132,6 +134,38 @@ export function jitExecTokenRoutes(db: Db) {
     const resolvedAgentId = requestedAgentId ?? (req.actor.type === "agent" ? req.actor.agentId : null);
 
     const actor = getActorInfo(req);
+
+    // ── Dedup: reuse existing pending approval for same agent+target ──
+    const existingPending = await db
+      .select()
+      .from(approvalsTable)
+      .where(
+        and(
+          drizzleEq(approvalsTable.companyId, companyId),
+          drizzleEq(approvalsTable.type, "jit_exec_token_adhoc"),
+          drizzleEq(approvalsTable.status, "pending"),
+          sql`${approvalsTable.payload}->>'target' = ${target}`,
+          sql`${approvalsTable.createdAt} > now() - interval '15 minutes'`,
+          actor.actorType === "agent"
+            ? drizzleEq(approvalsTable.requestedByAgentId, actor.actorId)
+            : actor.actorType === "user"
+              ? sql`${approvalsTable.requestedByUserId} = ${actor.actorId}`
+              : undefined,
+        )
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+
+    if (existingPending) {
+      logger.info({ approvalId: existingPending.id, target }, "Reusing existing pending ad-hoc exec token approval (dedup)");
+      res.status(202).json({
+        status: "pending_approval",
+        approvalId: existingPending.id,
+        deduplicated: true,
+      });
+      return;
+    }
+
     const approval = await approvalsSvc.create(companyId, {
       type: "jit_exec_token_adhoc",
       requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -140,6 +174,8 @@ export function jitExecTokenRoutes(db: Db) {
         target,
         scopes: validScopes,
         agentId: resolvedAgentId,
+        ...(originSessionKey ? { originSessionKey } : {}),
+        ...(originGatewayPort ? { originGatewayPort } : {}),
       },
     });
 

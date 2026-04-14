@@ -1,7 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { issueRoutes } from "../routes/issues.js";
+import { issueRoutes, resetSelfProvisionPolicyCache } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
 import { resetJitTargetRegistryCache } from "../jit-target-registry.js";
 import { _clearIssuanceStore } from "../jit-issuance-store.js";
@@ -52,8 +52,10 @@ vi.mock("../services/index.js", () => ({
   approvalService: () => mockApprovalService,
   documentService: () => ({}),
   executionWorkspaceService: () => ({}),
+  feedbackService: () => ({}),
   goalService: () => ({}),
   heartbeatService: () => mockHeartbeatService,
+  instanceSettingsService: () => ({}),
   issueApprovalService: () => mockIssueApprovalService,
   issueService: () => mockIssueService,
   logActivity: mockLogActivity,
@@ -77,7 +79,11 @@ function createMockDb() {
   const whereStep = { where: vi.fn(async () => undefined) };
   const setStep = { set: vi.fn(() => whereStep) };
   mockDbUpdate.mockReturnValue(setStep);
-  return { update: mockDbUpdate } as any;
+  // Dedup queries: db.select().from(...).where(...).limit(...).then(...)
+  const limitStep = { limit: vi.fn(() => ({ then: vi.fn((fn: any) => Promise.resolve(fn([]))) })) };
+  const selectWhereStep = { where: vi.fn(() => limitStep) };
+  const fromStep = { from: vi.fn(() => selectWhereStep) };
+  return { update: mockDbUpdate, select: vi.fn(() => fromStep) } as any;
 }
 
 // ── Test helpers ────────────────────────────────────────────────────
@@ -203,7 +209,10 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
     delete process.env.AGENT_ACCESS_BEARER_TOKEN_FILE;
     delete process.env.AGENT_ACCESS_TICKET_SECRET;
     delete process.env.JIT_TARGET_REGISTRY;
+    delete process.env.JIT_AGENT_SELF_PROVISION_POLICY;
+    delete process.env.REX_JWT_SECRET;
     resetJitTargetRegistryCache();
+    resetSelfProvisionPolicyCache();
     _clearIssuanceStore();
   });
 
@@ -624,6 +633,71 @@ describe("POST /api/issues/:id/jit-ssh-token", () => {
     // Clean up
     delete process.env.JIT_AGENT_SELF_PROVISION_POLICY;
     resetSelfProvisionPolicyCache();
+  });
+
+  it("auto-approves issue-scoped exec tokens for assignee agents when self-provision policy matches", async () => {
+    const testProjectId = "test-project-exec-1";
+    process.env.JIT_AGENT_SELF_PROVISION_POLICY = JSON.stringify({
+      rules: [{ projectId: testProjectId, targets: ["work.int"], maxTtlMinutes: 120 }],
+    });
+    process.env.REX_JWT_SECRET = "test-secret";
+    const { resetSelfProvisionPolicyCache } = await import("../routes/issues.js");
+    resetSelfProvisionPolicyCache();
+
+    const assigneeAgentId = "22222222-2222-4222-8222-222222222222";
+    const agentApp = express();
+    agentApp.use(express.json());
+    agentApp.use((req, _res, next) => {
+      (req as any).actor = {
+        type: "agent",
+        agentId: assigneeAgentId,
+        companyId: "company-1",
+        companyIds: ["company-1"],
+        source: "agent_key",
+        isInstanceAdmin: false,
+      };
+      next();
+    });
+    const agentDb = createMockDb();
+    agentApp.use("/api", issueRoutes(agentDb, {} as any));
+    agentApp.use(errorHandler);
+
+    mockIssueService.getById.mockResolvedValue({ ...makeIssue(), projectId: testProjectId });
+    mockApprovalService.create.mockResolvedValue({ id: APPROVAL_ID });
+    mockApprovalService.approve.mockResolvedValue(undefined);
+    mockApprovalService.getById.mockResolvedValue({
+      id: APPROVAL_ID,
+      companyId: "company-1",
+      type: "jit_exec_token",
+      status: "approved",
+      decidedAt: new Date(),
+      decidedByUserId: "local-board",
+      payload: {
+        issueId: ISSUE_ID,
+        target: "work.int",
+        scopes: ["exec", "exec:script", "exec:stream"],
+        assigneeAgentId,
+      },
+    });
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-exec-self" });
+
+    const res = await request(agentApp)
+      .post(`/api/issues/${ISSUE_ID}/jit-exec-token`)
+      .send({ target: "work.int" })
+      .expect(201);
+
+    expect(res.body.token).toEqual(expect.any(String));
+    expect(res.body.expiresAt).toEqual(expect.any(String));
+    expect(res.body.issuanceId).toEqual(expect.any(String));
+    expect(res.body.status).not.toBe("pending_approval");
+
+    expect(mockApprovalService.create).toHaveBeenCalledOnce();
+    const [, approvalData] = mockApprovalService.create.mock.calls[0];
+    expect(approvalData.requestedByAgentId).toBe(assigneeAgentId);
+    expect(approvalData.requestedByUserId).toBeNull();
+
+    expect(mockApprovalService.approve).toHaveBeenCalledOnce();
+    expect(mockApprovalService.approve.mock.calls[0][2]).toBe("Auto-approved: assignee agent self-provision");
   });
 
   it("wakes the assigned agent after token provisioning", async () => {

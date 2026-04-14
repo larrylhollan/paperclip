@@ -7,7 +7,7 @@ import multer from "multer";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { issueExecutionDecisions, approvals as approvalsTable } from "@paperclipai/db";
-import { eq as drizzleEq } from "drizzle-orm";
+import { and, eq as drizzleEq, sql } from "drizzle-orm";
 import {
   addIssueCommentSchema,
   createIssueAttachmentMetadataSchema,
@@ -3417,6 +3417,37 @@ export function issueRoutes(
     const approvalId = req.body.approvalId as string | undefined;
     if (!approvalId) {
       const actor = getActorInfo(req);
+
+      // ── Dedup: reuse existing pending approval for same issue+agent+target ──
+      const existingPending = await db
+        .select()
+        .from(approvalsTable)
+        .where(
+          and(
+            drizzleEq(approvalsTable.companyId, issue.companyId),
+            drizzleEq(approvalsTable.type, "jit_exec_token"),
+            drizzleEq(approvalsTable.status, "pending"),
+            sql`${approvalsTable.payload}->>'issueId' = ${id}`,
+            sql`${approvalsTable.payload}->>'target' = ${target}`,
+            sql`${approvalsTable.createdAt} > now() - interval '15 minutes'`,
+          )
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+
+      if (existingPending) {
+        logger.info(
+          { approvalId: existingPending.id, issueId: id, target },
+          "Reusing existing pending exec token approval (dedup)",
+        );
+        res.status(202).json({
+          status: "pending_approval",
+          approvalId: existingPending.id,
+          deduplicated: true,
+        });
+        return;
+      }
+
       const approval = await approvalsSvc.create(issue.companyId, {
         type: "jit_exec_token",
         requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
