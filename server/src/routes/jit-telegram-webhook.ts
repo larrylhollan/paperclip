@@ -145,7 +145,11 @@ export function jitTelegramWebhookRoutes(db: Db) {
                       stream: false,
                     });
 
-                    const wakeResp = await fetch(wakeUrl, {
+                    // Fire-and-forget: the gateway processes a full agent turn which
+                    // can take 30s+. We don't need to wait for the response — just
+                    // confirm the request was accepted and let it complete in the background.
+                    sessionWakeSent = true;
+                    fetch(wakeUrl, {
                       method: "POST",
                       headers: {
                         "Content-Type": "application/json",
@@ -153,14 +157,17 @@ export function jitTelegramWebhookRoutes(db: Db) {
                         "x-openclaw-session-key": originSessionKey,
                       },
                       body: wakeBody,
-                      signal: AbortSignal.timeout(10_000),
+                      signal: AbortSignal.timeout(120_000),
+                    }).then((wakeResp) => {
+                      if (!wakeResp.ok) {
+                        logger.warn({ status: wakeResp.status, approvalId: execApprovalId }, "session-targeted wake returned non-OK");
+                      } else {
+                        logger.info({ approvalId: execApprovalId, agentId: agentToWake }, "session-targeted wake completed via gateway");
+                      }
+                    }).catch((err) => {
+                      logger.warn({ err, approvalId: execApprovalId }, "session-targeted wake failed (fire-and-forget)");
                     });
-                    sessionWakeSent = wakeResp.ok;
-                    if (!wakeResp.ok) {
-                      logger.warn({ status: wakeResp.status, approvalId: execApprovalId }, "session-targeted wake returned non-OK");
-                    } else {
-                      logger.info({ approvalId: execApprovalId, agentId: agentToWake }, "session-targeted wake sent via gateway");
-                    }
+                    logger.info({ approvalId: execApprovalId, agentId: agentToWake }, "session-targeted wake dispatched via gateway (fire-and-forget)");
                   }
                 } catch (err) {
                   logger.warn({ err, approvalId: execApprovalId }, "session-targeted wake failed, falling back to heartbeat");
