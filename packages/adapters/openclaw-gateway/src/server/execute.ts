@@ -399,6 +399,7 @@ function buildWakeText(
     "PAPERCLIP_AGENT_ID",
     "PAPERCLIP_COMPANY_ID",
     "PAPERCLIP_API_URL",
+    "PAPERCLIP_API_KEY",
     "PAPERCLIP_TASK_ID",
     "PAPERCLIP_WAKE_REASON",
     "PAPERCLIP_WAKE_COMMENT_ID",
@@ -414,6 +415,15 @@ function buildWakeText(
     envLines.push(`${key}=${value}`);
   }
 
+  // Fall back to reading claimed key file if PAPERCLIP_API_KEY was not already in paperclipEnv
+  const hasApiKeyInEnv = Boolean(paperclipEnv.PAPERCLIP_API_KEY);
+  if (!hasApiKeyInEnv && resolvedApiKey) {
+    envLines.push(`PAPERCLIP_API_KEY=${resolvedApiKey}`);
+  }
+  if (!hasApiKeyInEnv && !resolvedApiKey) {
+    envLines.push(`PAPERCLIP_API_KEY=<token from ${claimedApiKeyPath}>`);
+  }
+
   const issueIdHint = payload.taskId ?? payload.issueId ?? "";
   const apiBaseHint = paperclipEnv.PAPERCLIP_API_URL ?? "<set PAPERCLIP_API_URL>";
 
@@ -424,13 +434,12 @@ function buildWakeText(
     "",
     "Set these values in your run context:",
     ...envLines,
-    ...(resolvedApiKey
-      ? [`PAPERCLIP_API_KEY=${resolvedApiKey}`]
-      : [
-          `PAPERCLIP_API_KEY=<token from ${claimedApiKeyPath}>`,
+    ...(!hasApiKeyInEnv && !resolvedApiKey
+      ? [
           "",
           `Load PAPERCLIP_API_KEY from ${claimedApiKeyPath} (the token you saved after claim-api-key).`,
-        ]),
+        ]
+      : []),
     "",
     `api_base=${apiBaseHint}`,
     `task_id=${payload.taskId ?? ""}`,
@@ -1174,6 +1183,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
   } catch {
     // Key file not readable — parent context fetch will be skipped.
+  }
+
+  // Inject PAPERCLIP_API_KEY into env so child agents (e.g. jit_connect.py) can use it
+  if (resolvedApiKey) {
+    paperclipEnv.PAPERCLIP_API_KEY = resolvedApiKey;
   }
 
   if (wakePayload.issueId && apiUrl && resolvedApiKey) {

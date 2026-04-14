@@ -3197,13 +3197,15 @@ export function heartbeatService(db: Db) {
   async function startNextQueuedRunForAgent(agentId: string) {
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
-      if (!agent) return [];
+      if (!agent) { logger.warn({ agentId }, "[queue-debug] agent not found"); return []; }
       if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
+        logger.warn({ agentId, agentStatus: agent.status }, "[queue-debug] agent not invokable");
         return [];
       }
       const policy = parseHeartbeatPolicy(agent);
       const runningCount = await countRunningRunsForAgent(agentId);
       const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
+      logger.info({ agentId, agentName: agent.name, maxConcurrentRuns: policy.maxConcurrentRuns, runningCount, availableSlots }, "[queue-debug] slot check");
       if (availableSlots <= 0) return [];
 
       const queuedRuns = await db
@@ -3231,6 +3233,7 @@ export function heartbeatService(db: Db) {
   }
 
   async function executeRun(runId: string) {
+    logger.info({ runId }, "[queue-debug] executeRun called");
     let run = await getRun(runId);
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
@@ -3884,6 +3887,7 @@ export function heartbeatService(db: Db) {
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+      logger.info({ runId: run.id, agentName: agent.name, adapterType: agent.adapterType }, "[queue-debug] calling adapter.execute");
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,

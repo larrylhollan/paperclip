@@ -1836,8 +1836,13 @@ export function issueRoutes(
       void revokeCredentialsOnIssueClose(db, issue.id, issue.status).catch((err) =>
         logger.warn({ err, issueId: issue.id }, "failed to revoke JIT credentials on issue close"));
       // Fix for #3168: cancel any queued/running runs tied to this issue
-      void heartbeat.cancelRunsForIssue(issue.id, `Cancelled because issue was ${issue.status}`).catch((err) =>
-        logger.warn({ err, issueId: issue.id }, "failed to cancel runs on issue close"));
+      // Awaited (not fire-and-forget) so the PATCH doesn't return while stale runs
+      // are still queued — prevents zombie live-run buildup during bulk cancels.
+      try {
+        await heartbeat.cancelRunsForIssue(issue.id, `Cancelled because issue was ${issue.status}`);
+      } catch (err) {
+        logger.warn({ err, issueId: issue.id }, "failed to cancel runs on issue close");
+      }
     }
 
     if (req.body.description !== undefined) {
