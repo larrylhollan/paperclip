@@ -329,6 +329,7 @@ interface SelfProvisionRule {
   projectId: string;
   targets: string[];
   maxTtlMinutes?: number;
+  principal?: string;
 }
 
 interface SelfProvisionPolicy {
@@ -3128,14 +3129,18 @@ export function issueRoutes(
       return;
     }
 
-    const requestedPrincipal = issuanceReq.principal ?? target.defaultPrincipal;
+    let requestedPrincipal = issuanceReq.principal ?? target.defaultPrincipal;
     let requestedTtlMinutes = issuanceReq.ttlMinutes ?? target.defaultTtlMinutes;
 
-    // Enforce maxTtlMinutes from self-provision policy (if agent self-provisioning).
+    // Enforce maxTtlMinutes and principal from self-provision policy (if agent self-provisioning).
     if (isAssigneeAgent) {
       const policyRule = matchSelfProvisionPolicy(issue.projectId, issuanceReq.target);
       if (policyRule?.maxTtlMinutes && requestedTtlMinutes > policyRule.maxTtlMinutes) {
         requestedTtlMinutes = policyRule.maxTtlMinutes;
+      }
+      // If the policy specifies a principal and the agent didn't explicitly request one, use it
+      if (policyRule?.principal && !issuanceReq.principal) {
+        requestedPrincipal = policyRule.principal;
       }
     }
 
