@@ -100,9 +100,11 @@ export function jitTelegramWebhookRoutes(db: Db) {
             const execApproval = await approvalsSvc.getById(execApprovalId);
             const payload = execApproval?.payload as Record<string, unknown> | undefined;
             const assigneeAgentId = typeof payload?.assigneeAgentId === "string" ? payload.assigneeAgentId : null;
+            // Ad-hoc exec token requests store the agent as payload.agentId (not requestedByAgentId)
+            const payloadAgentId = typeof payload?.agentId === "string" ? payload.agentId : null;
             const agentToWake = typeof payload?.requestedByAgentId === "string"
               ? payload.requestedByAgentId
-              : (assigneeAgentId ?? (typeof execApproval?.requestedByAgentId === "string" ? execApproval.requestedByAgentId : null));
+              : (assigneeAgentId ?? (typeof execApproval?.requestedByAgentId === "string" ? execApproval.requestedByAgentId : null) ?? payloadAgentId);
             const issueId = typeof payload?.issueId === "string" ? payload.issueId : undefined;
             const originSessionKey = typeof payload?.originSessionKey === "string" ? payload.originSessionKey : null;
             const originGatewayPort = typeof payload?.originGatewayPort === "number" ? payload.originGatewayPort : null;
@@ -119,6 +121,10 @@ export function jitTelegramWebhookRoutes(db: Db) {
               } catch (err) {
                 logger.warn({ err, approvalId: execApprovalId }, "failed to unblock issue after exec token approval");
               }
+            }
+
+            if (!agentToWake) {
+              logger.warn({ approvalId: execApprovalId, payload: payload ? Object.keys(payload) : [] }, "exec token approved but agentToWake resolved to null — no agent to wake");
             }
 
             if (agentToWake) {

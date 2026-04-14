@@ -309,6 +309,61 @@ describe("POST /api/telegram/jit-webhook", () => {
     expect(body.text).toContain("Not found");
   });
 
+  it("wakes agent via payload.agentId for ad-hoc exec token approvals", async () => {
+    // Ad-hoc exec token requests store the agent as payload.agentId (not requestedByAgentId).
+    // The webhook should fall back to payload.agentId when requestedByAgentId is absent.
+    mockApprovalGetById.mockResolvedValue({
+      id: "exec-1",
+      requestedByAgentId: null,
+      payload: {
+        target: "work.int",
+        scopes: ["exec"],
+        agentId: "agent-dani",
+        // no requestedByAgentId, no assigneeAgentId
+      },
+    });
+    mockAgentGetById.mockResolvedValue({
+      id: "agent-dani",
+      urlKey: "coo",
+      adapterConfig: { authToken: "tok-123" },
+    });
+
+    const app = createApp();
+    await request(app)
+      .post("/api/telegram/jit-webhook")
+      .send(callbackUpdate(12345, "jit:approve-exec:exec-1"))
+      .expect(200);
+
+    expect(mockApprove).toHaveBeenCalledWith("exec-1", "telegram:12345", expect.any(String));
+    // Should wake via heartbeat since no originSessionKey/originGatewayPort
+    expect(mockWakeup).toHaveBeenCalledWith("agent-dani", expect.objectContaining({
+      reason: "jit_exec_token_approved",
+    }));
+  });
+
+  it("logs warning when agentToWake resolves to null on exec token approval", async () => {
+    // When no agent ID is available at all, the webhook should log a warning
+    mockApprovalGetById.mockResolvedValue({
+      id: "exec-2",
+      requestedByAgentId: null,
+      payload: {
+        target: "work.int",
+        scopes: ["exec"],
+        // no agentId, no requestedByAgentId, no assigneeAgentId
+      },
+    });
+
+    const app = createApp();
+    await request(app)
+      .post("/api/telegram/jit-webhook")
+      .send(callbackUpdate(12345, "jit:approve-exec:exec-2"))
+      .expect(200);
+
+    expect(mockApprove).toHaveBeenCalledWith("exec-2", "telegram:12345", expect.any(String));
+    // No agent to wake — should NOT call wakeup
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
   it("gracefully handles issue service failures during SSH approve", async () => {
     mockUpdateStatus.mockResolvedValue({
       id: "pre-1",
