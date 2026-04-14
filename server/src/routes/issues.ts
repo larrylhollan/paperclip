@@ -1834,6 +1834,9 @@ export function issueRoutes(
     if (isClosing) {
       void revokeCredentialsOnIssueClose(db, issue.id, issue.status).catch((err) =>
         logger.warn({ err, issueId: issue.id }, "failed to revoke JIT credentials on issue close"));
+      // Fix for #3168: cancel any queued/running runs tied to this issue
+      void heartbeat.cancelRunsForIssue(issue.id, `Cancelled because issue was ${issue.status}`).catch((err) =>
+        logger.warn({ err, issueId: issue.id }, "failed to cancel runs on issue close"));
     }
 
     if (req.body.description !== undefined) {
@@ -3354,9 +3357,11 @@ export function issueRoutes(
   });
 
   // ── JIT exec token provisioning (two-phase approval flow) ──────────
-  // All exec token requests require Telegram approval — no auto-approve.
-  // Phase A (no approvalId): creates a pending approval, sends Telegram
-  //   notification, returns 202.
+  // Issue-scoped exec requests follow the same assignee self-provision
+  // policy as SSH tokens. Matching project+target combinations auto-approve
+  // for the assigned agent; all other exec requests use the normal approval
+  // notification flow.
+  // Phase A (no approvalId): auto-approves or creates a pending approval.
   // Phase B (with approvalId): validates the approved approval, signs the
   //   JWT, stores issuance, posts comment, and wakes the agent.
 
@@ -3387,13 +3392,21 @@ export function issueRoutes(
       return;
     }
 
-    const { target, scopes } = req.body as { target?: string; scopes?: string[] };
+    const { target, scopes, originSessionKey, originGatewayPort } = req.body as {
+      target?: string;
+      scopes?: string[];
+      originSessionKey?: string;
+      originGatewayPort?: number;
+    };
     if (!target || typeof target !== "string") {
       res.status(400).json({ error: "Missing required field: target" });
       return;
     }
 
     const validScopes = scopes && Array.isArray(scopes) ? scopes : ["exec", "exec:script", "exec:stream"];
+    const selfProvisionRule = isAssigneeAgent
+      ? matchSelfProvisionPolicy(issue.projectId, target)
+      : null;
 
     // ── Phase A: Request approval ──────────────────────────────────
     const approvalId = req.body.approvalId as string | undefined;
@@ -3408,42 +3421,54 @@ export function issueRoutes(
           target,
           scopes: validScopes,
           assigneeAgentId: issue.assigneeAgentId ?? null,
+          ...(originSessionKey ? { originSessionKey } : {}),
+          ...(originGatewayPort ? { originGatewayPort } : {}),
         },
       });
       await issueApprovalsSvc.link(id, approval.id, {
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
 
-      // Look up agent name for the notification
-      let agentName: string | undefined;
-      if (isAssigneeAgent && req.actor.agentId) {
-        const agent = await agentsSvc.getById(req.actor.agentId);
-        agentName = agent?.name ?? undefined;
+      if (req.actor.type === "board" || selfProvisionRule) {
+        const decidedByUserId = actor.actorType === "user" ? actor.actorId : "";
+        const decisionNote = selfProvisionRule
+          ? "Auto-approved: assignee agent self-provision"
+          : "Auto-approved: board user exec request";
+        await approvalsSvc.approve(approval.id, decidedByUserId, decisionNote);
+        (req.body as any).approvalId = approval.id;
+      } else {
+        // Look up agent name for the notification
+        let agentName: string | undefined;
+        if (isAssigneeAgent && req.actor.agentId) {
+          const agent = await agentsSvc.getById(req.actor.agentId);
+          agentName = agent?.name ?? undefined;
+        }
+
+        // Await notification delivery so we can surface failures to the caller.
+        // The agent polling loop depends on Jeff seeing this notification.
+        const notifResult = await sendExecTokenApprovalNotification({
+          approvalId: approval.id,
+          issueIdentifier: issue.identifier ?? undefined,
+          issueTitle: issue.title,
+          target,
+          scopes: validScopes,
+          agentName,
+          agentId: isAssigneeAgent ? req.actor.agentId! : undefined,
+        });
+
+        res.status(202).json({
+          status: "pending_approval",
+          approvalId: approval.id,
+          notificationDelivered: notifResult.sent,
+          ...(notifResult.sent ? {} : { notificationError: notifResult.reason }),
+        });
+        return;
       }
-
-      // Await notification delivery so we can surface failures to the caller.
-      // The agent polling loop depends on Jeff seeing this notification.
-      const notifResult = await sendExecTokenApprovalNotification({
-        approvalId: approval.id,
-        issueIdentifier: issue.identifier ?? undefined,
-        issueTitle: issue.title,
-        target,
-        scopes: validScopes,
-        agentName,
-        agentId: isAssigneeAgent ? req.actor.agentId! : undefined,
-      });
-
-      res.status(202).json({
-        status: "pending_approval",
-        approvalId: approval.id,
-        notificationDelivered: notifResult.sent,
-        ...(notifResult.sent ? {} : { notificationError: notifResult.reason }),
-      });
-      return;
     }
 
     // ── Phase B: Execute after approval ────────────────────────────
-    const approval = await approvalsSvc.getById(approvalId);
+    const resolvedApprovalId = (req.body as any).approvalId ?? approvalId;
+    const approval = await approvalsSvc.getById(resolvedApprovalId);
     if (!approval) {
       res.status(404).json({ error: "Approval not found" });
       return;
@@ -3464,6 +3489,11 @@ export function issueRoutes(
       res.status(409).json({ error: "Approval has already been consumed" });
       return;
     }
+
+    const approvedTarget = typeof approvalPayload.target === "string" ? approvalPayload.target : target;
+    const approvedScopes = Array.isArray(approvalPayload.scopes)
+      ? approvalPayload.scopes as string[]
+      : validScopes;
 
     if (approval.decidedAt) {
       const decidedAtMs = new Date(approval.decidedAt).getTime();
@@ -3495,8 +3525,8 @@ export function issueRoutes(
       exp: now + ttlSeconds,
       jti,
       issue_id: id,
-      target,
-      scopes: validScopes,
+      target: approvedTarget,
+      scopes: approvedScopes,
     };
 
     const token = signExecJwt(claims, secret);
@@ -3505,19 +3535,19 @@ export function issueRoutes(
     await db
       .update(approvalsTable)
       .set({ payload: { ...approvalPayload, consumedAt: new Date().toISOString() } })
-      .where(drizzleEq(approvalsTable.id, approvalId));
+      .where(drizzleEq(approvalsTable.id, resolvedApprovalId));
 
     // Store issuance for tracking and revocation.
     const issuanceId = createIssuanceId();
     const ttlMs = ttlSeconds * 1000;
-    await storeIssuance(issuanceId, { type: "exec_token", jti, exp: claims.exp, target, agentId }, id, ttlMs);
+    await storeIssuance(issuanceId, { type: "exec_token", jti, exp: claims.exp, target: approvedTarget, agentId }, id, ttlMs);
 
     // Post a metadata comment on the issue (NOT the token itself).
     const commentPayload = {
       type: "jit-exec-token",
       issuance_id: issuanceId,
-      target,
-      scopes: validScopes,
+      target: approvedTarget,
+      scopes: approvedScopes,
       expires_at: expiresAt,
       issued_to: claims.sub,
     };
@@ -3561,7 +3591,7 @@ export function issueRoutes(
           source: "automation",
           triggerDetail: "system",
           reason: "jit_exec_token_provisioned",
-          payload: { issueId: id, commentId: comment.id, target },
+          payload: { issueId: id, commentId: comment.id, target: approvedTarget },
           requestedByActorType: actor.actorType,
           requestedByActorId: actor.actorId,
           contextSnapshot: {

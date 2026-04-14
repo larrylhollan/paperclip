@@ -2618,8 +2618,26 @@ export function heartbeatService(db: Db) {
     }
 
     const context = parseObject(run.contextSnapshot);
+
+    // Fix for #3168: cancel queued runs whose issue is already done/cancelled
+    const runIssueId = readNonEmptyString(context.issueId);
+    if (runIssueId) {
+      const [issueRow] = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, runIssueId))
+        .limit(1);
+      if (issueRow && (issueRow.status === "done" || issueRow.status === "cancelled")) {
+        await cancelRunInternal(
+          run.id,
+          `Cancelled because the associated issue is ${issueRow.status}`,
+        );
+        return null;
+      }
+    }
+
     const budgetBlock = await budgets.getInvocationBlock(run.companyId, run.agentId, {
-      issueId: readNonEmptyString(context.issueId),
+      issueId: runIssueId,
       projectId: readNonEmptyString(context.projectId),
     });
     if (budgetBlock) {
@@ -5360,6 +5378,23 @@ export function heartbeatService(db: Db) {
     },
 
     cancelRun: (runId: string) => cancelRunInternal(runId),
+
+    cancelRunsForIssue: async (issueId: string, reason?: string) => {
+      // Fix for #3168: cancel all queued/running runs associated with a closed issue
+      const staleRuns = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            inArray(heartbeatRuns.status, ["queued", "running"]),
+            sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+          ),
+        );
+      for (const run of staleRuns) {
+        await cancelRunInternal(run.id, reason ?? "Cancelled because the associated issue was closed");
+      }
+      return staleRuns.length;
+    },
 
     cancelActiveForAgent: (agentId: string) => cancelActiveForAgentInternal(agentId),
 
