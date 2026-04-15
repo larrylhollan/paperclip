@@ -984,6 +984,21 @@ export function IssueDetail() {
     placeholderData: keepPreviousDataForSameQueryTail<Issue[]>(issue?.id ?? "pending"),
   });
 
+  // Filter out runs already shown by the live widget to avoid duplication
+  const timelineRuns = useMemo(() => {
+    const liveIds = new Set<string>();
+    for (const r of liveRuns ?? []) liveIds.add(r.id);
+    if (activeRun) liveIds.add(activeRun.id);
+    if (liveIds.size === 0) return linkedRuns ?? [];
+    return (linkedRuns ?? []).filter((r) => !liveIds.has(r.runId));
+  }, [linkedRuns, liveRuns, activeRun]);
+
+  const { data: allIssues } = useQuery({
+    queryKey: queryKeys.issues.list(selectedCompanyId!),
+    queryFn: () => issuesApi.list(selectedCompanyId!, { limit: 200 }),
+    enabled: !!selectedCompanyId,
+  });
+
   const { data: agents } = useQuery({
     queryKey: queryKeys.agents.list(selectedCompanyId!),
     queryFn: () => agentsApi.list(selectedCompanyId!),

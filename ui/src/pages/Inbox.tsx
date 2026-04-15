@@ -744,7 +744,7 @@ export function Inbox() {
 
   const { data: issues, isLoading: isIssuesLoading } = useQuery({
     queryKey: [...queryKeys.issues.list(selectedCompanyId!), "with-routine-executions"],
-    queryFn: () => issuesApi.list(selectedCompanyId!, { includeRoutineExecutions: true }),
+    queryFn: () => issuesApi.list(selectedCompanyId!, { includeRoutineExecutions: true, limit: 200 }),
     enabled: !!selectedCompanyId,
   });
   const {
@@ -758,6 +758,7 @@ export function Inbox() {
         inboxArchivedByUserId: "me",
         status: INBOX_MINE_ISSUE_STATUS_FILTER,
         includeRoutineExecutions: true,
+        limit: 200,
       }),
     enabled: !!selectedCompanyId,
   });
@@ -771,6 +772,7 @@ export function Inbox() {
         touchedByUserId: "me",
         status: INBOX_MINE_ISSUE_STATUS_FILTER,
         includeRoutineExecutions: true,
+        limit: 200,
       }),
     enabled: !!selectedCompanyId,
   });

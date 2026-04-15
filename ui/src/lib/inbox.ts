@@ -13,7 +13,7 @@ import {
   type IssueFilterState,
 } from "./issue-filters";
 
-export const RECENT_ISSUES_LIMIT = 100;
+export const RECENT_ISSUES_LIMIT = 300;
 export const FAILED_RUN_STATUSES = new Set(["failed", "timed_out"]);
 export const ACTIONABLE_APPROVAL_STATUSES = new Set(["pending", "revision_requested"]);
 export const DISMISSED_KEY = "paperclip:inbox:dismissed";

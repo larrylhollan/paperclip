@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useCallback, useState } from "react";
 import { useLocation, useSearchParams } from "@/lib/router";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueries, useMutation, useQueryClient } from "@tanstack/react-query";
+import type { Issue } from "@paperclipai/shared";
 import { issuesApi } from "../api/issues";
 import { agentsApi } from "../api/agents";
 import { projectsApi } from "../api/projects";
@@ -26,6 +27,7 @@ export function buildIssuesSearchUrl(currentHref: string, search: string): strin
 
   return `${url.pathname}${url.search}${url.hash}`;
 const DEFAULT_ACTIVE_STATUS = "backlog,todo,in_progress,in_review,blocked";
+const ALL_STATUSES = ["backlog", "todo", "in_progress", "blocked", "done", "cancelled"] as const;
 
 function readPersistedStatusFilter(companyId: string | null): string | undefined {
   if (!companyId) return DEFAULT_ACTIVE_STATUS;
@@ -106,18 +108,44 @@ export function Issues() {
     setBreadcrumbs([{ label: "Issues" }]);
   }, [setBreadcrumbs]);
 
-  const { data: issues, isLoading, error } = useQuery({
-    queryKey: [
-      ...queryKeys.issues.list(selectedCompanyId!),
-      "participant-agent",
-      participantAgentId ?? "__all__",
-      "with-routine-executions",
-    ],
-    queryFn: () => issuesApi.list(selectedCompanyId!, { participantAgentId, includeRoutineExecutions: true }),
-    queryKey: [...queryKeys.issues.list(selectedCompanyId!), "participant-agent", participantAgentId ?? "__all__", "status", apiStatusFilter ?? "__all__"],
-    queryFn: () => issuesApi.list(selectedCompanyId!, { participantAgentId, status: apiStatusFilter }),
-    enabled: !!selectedCompanyId,
+  // When no status filter is active, fetch each status in parallel (100 per status)
+  const parallelResults = useQueries({
+    queries: !apiStatusFilter && selectedCompanyId
+      ? ALL_STATUSES.map((status) => ({
+          queryKey: [...queryKeys.issues.list(selectedCompanyId), "per-status", status, "participant-agent", participantAgentId ?? "__all__"],
+          queryFn: () => issuesApi.list(selectedCompanyId, { participantAgentId, status, limit: 100, includeRoutineExecutions: true }),
+        }))
+      : [],
   });
+
+  // When a specific status filter is active, single call with limit 100
+  const singleResult = useQuery({
+    queryKey: [...queryKeys.issues.list(selectedCompanyId!), "participant-agent", participantAgentId ?? "__all__", "status", apiStatusFilter ?? "__all__"],
+    queryFn: () => issuesApi.list(selectedCompanyId!, { participantAgentId, status: apiStatusFilter, limit: 100 }),
+    enabled: !!selectedCompanyId && !!apiStatusFilter,
+  });
+
+  const issues = useMemo(() => {
+    if (apiStatusFilter) return singleResult.data;
+    const seen = new Set<string>();
+    const merged: Issue[] = [];
+    for (const result of parallelResults) {
+      for (const issue of result.data ?? []) {
+        if (!seen.has(issue.id)) {
+          seen.add(issue.id);
+          merged.push(issue);
+        }
+      }
+    }
+    return merged;
+  }, [apiStatusFilter, singleResult.data, parallelResults]);
+
+  const isLoading = apiStatusFilter
+    ? singleResult.isLoading
+    : parallelResults.some((r) => r.isLoading);
+  const error = apiStatusFilter
+    ? singleResult.error
+    : (parallelResults.find((r) => r.error)?.error ?? null);
 
   const updateIssue = useMutation({
     mutationFn: ({ id, data }: { id: string; data: Record<string, unknown> }) =>

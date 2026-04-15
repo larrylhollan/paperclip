@@ -44,7 +44,7 @@ export function Activity() {
 
   const { data: issues } = useQuery({
     queryKey: queryKeys.issues.list(selectedCompanyId!),
-    queryFn: () => issuesApi.list(selectedCompanyId!),
+    queryFn: () => issuesApi.list(selectedCompanyId!, { limit: 300 }),
     enabled: !!selectedCompanyId,
   });
 
