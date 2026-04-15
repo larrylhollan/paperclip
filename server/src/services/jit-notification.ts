@@ -548,6 +548,7 @@ export interface ExecTokenApprovalNotificationParams {
   agentName?: string;
   agentId?: string;
   adhoc?: boolean;
+  reason?: string;
 }
 
 /**
@@ -573,6 +574,9 @@ export async function sendExecTokenApprovalNotification(
       lines.push(`<b>${escapeHtml(params.issueIdentifier)}</b>: ${escapeHtml(params.issueTitle)}`);
     } else if (params.adhoc) {
       lines.push(`<i>Ad-hoc request (no issue)</i>`);
+    }
+    if (params.reason) {
+      lines.push(`  → Reason: ${escapeHtml(params.reason)}`);
     }
     lines.push(`  → Target: <b>${escapeHtml(params.target)}</b>`);
     lines.push(`  → Scopes: ${escapeHtml(params.scopes.join(", "))}`);

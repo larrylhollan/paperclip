@@ -31,13 +31,15 @@ export function jitExecTokenRoutes(db: Db) {
   const agentsSvc = agentService(db);
 
   router.post("/jit-exec-token", async (req, res) => {
-    const { target, scopes, agentId: requestedAgentId, approvalId, originSessionKey, originGatewayPort } = req.body as {
+    const { target, scopes, agentId: requestedAgentId, approvalId, originSessionKey, originGatewayPort, issueId: requestIssueId, reason: requestReason } = req.body as {
       target?: string;
       scopes?: string[];
       agentId?: string;
       approvalId?: string;
       originSessionKey?: string;
       originGatewayPort?: number;
+      issueId?: string;
+      reason?: string;
     };
 
     // Resolve companyId from actor context
@@ -176,6 +178,7 @@ export function jitExecTokenRoutes(db: Db) {
         agentId: resolvedAgentId,
         ...(originSessionKey ? { originSessionKey } : {}),
         ...(originGatewayPort ? { originGatewayPort } : {}),
+        ...(requestIssueId ? { issueId: requestIssueId } : {}),
       },
     });
 
@@ -195,6 +198,7 @@ export function jitExecTokenRoutes(db: Db) {
       agentName,
       agentId: resolvedAgentId ?? undefined,
       adhoc: true,
+      reason: requestReason,
     });
 
     res.status(202).json({

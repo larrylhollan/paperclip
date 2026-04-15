@@ -128,26 +128,26 @@ export function jitTelegramWebhookRoutes(db: Db) {
             }
 
             if (agentToWake) {
-              // Try session-targeted wake via gateway API if origin session info is available
+              // Wake via gateway /v1/chat/completions — proven to work.
+              // Telegram bot-to-bot messages are blocked by the platform (official FAQ).
               let sessionWakeSent = false;
               if (originSessionKey && originGatewayPort) {
                 try {
                   const agent = await agentsSvc.getById(agentToWake);
                   const adapterConfig = agent?.adapterConfig as Record<string, unknown> | undefined;
-                  // authToken is a top-level field in adapterConfig for openclaw_gateway agents
                   const gatewayToken = typeof adapterConfig?.authToken === "string" ? adapterConfig.authToken : null;
 
                   if (gatewayToken && agent?.urlKey) {
                     const wakeUrl = `http://127.0.0.1:${originGatewayPort}/v1/chat/completions`;
+                    const wakeContent = issueId
+                      ? `Your JIT request for ${payload?.target ?? "unknown"} has been approved (approvalId: ${execApprovalId}). Token is ready. Retry your jit_connect command to continue your work.`
+                      : `Your JIT request for ${payload?.target ?? "unknown"} has been approved (approvalId: ${execApprovalId}). Token is ready. First, send Jeff a short Telegram message confirming you received the approval and have the token, then retry your jit_connect command to continue your work.`;
                     const wakeBody = JSON.stringify({
                       model: `openclaw/${agent.urlKey}`,
-                      messages: [{ role: "user", content: `JIT exec token approved for ${payload?.target ?? "unknown"} (approvalId: ${execApprovalId}). Retry your command.` }],
+                      messages: [{ role: "user", content: wakeContent }],
                       stream: false,
                     });
 
-                    // Fire-and-forget: the gateway processes a full agent turn which
-                    // can take 30s+. We don't need to wait for the response — just
-                    // confirm the request was accepted and let it complete in the background.
                     sessionWakeSent = true;
                     fetch(wakeUrl, {
                       method: "POST",
@@ -157,7 +157,7 @@ export function jitTelegramWebhookRoutes(db: Db) {
                         "x-openclaw-session-key": originSessionKey,
                       },
                       body: wakeBody,
-                      signal: AbortSignal.timeout(120_000),
+                      signal: AbortSignal.timeout(300_000),
                     }).then((wakeResp) => {
                       if (!wakeResp.ok) {
                         logger.warn({ status: wakeResp.status, approvalId: execApprovalId }, "session-targeted wake returned non-OK");
@@ -174,7 +174,6 @@ export function jitTelegramWebhookRoutes(db: Db) {
                 }
               }
 
-              // Fall back to heartbeat wakeup if session wake wasn't sent
               if (!sessionWakeSent) {
                 void heartbeat.wakeup(agentToWake, {
                   source: "automation",

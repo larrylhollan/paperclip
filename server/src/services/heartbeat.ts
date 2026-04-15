@@ -92,6 +92,7 @@ const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
+const GHOST_CLAIM_STALE_MS = 5 * 60 * 1000;
 const execFile = promisify(execFileCallback);
 const ACTIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running"] as const;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
@@ -2486,6 +2487,7 @@ export function heartbeatService(db: Db) {
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
     now: Date,
+    retryReason = "process_lost",
   ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
@@ -2495,7 +2497,7 @@ export function heartbeatService(db: Db) {
       ...contextSnapshot,
       retryOfRunId: run.id,
       wakeReason: "process_lost_retry",
-      retryReason: "process_lost",
+      retryReason,
     };
 
     const queued = await db.transaction(async (tx) => {
@@ -2773,10 +2775,19 @@ export function heartbeatService(db: Db) {
     for (const { run, adapterType } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
+      // Ghost claims: adapter claimed the run (status=running) but never started
+      // execution — no PID, no processStartedAt. These block the agent's
+      // maxConcurrentRuns slots and cannot recover on their own.
+      const isGhostClaim = !run.processPid && !run.processStartedAt;
+
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
-        if (now.getTime() - refTime < staleThresholdMs) continue;
+        const elapsed = now.getTime() - refTime;
+        const effectiveThreshold = isGhostClaim
+          ? Math.min(staleThresholdMs, GHOST_CLAIM_STALE_MS)
+          : staleThresholdMs;
+        if (elapsed < effectiveThreshold) continue;
       }
 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
@@ -2813,12 +2824,18 @@ export function heartbeatService(db: Db) {
         });
       }
 
-      const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 3;
-      const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      // Retry ghost claims (adapter connection failure) and local child process losses
+      const shouldRetry =
+        (isGhostClaim || (tracksLocalChild && (!!run.processPid || !!run.processGroupId))) &&
+        (run.processLossRetryCount ?? 0) < 3;
+      const baseMessage = isGhostClaim
+        ? "Ghost claim -- adapter never started execution (no PID, no processStartedAt)"
+        : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      const errorCode = isGhostClaim ? "ghost_run_stale_claim" : "process_lost";
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying (attempt ${(run.processLossRetryCount ?? 0) + 1}/3)` : baseMessage,
-        errorCode: "process_lost",
+        errorCode,
         finishedAt: now,
       });
       await setWakeupStatus(run.wakeupRequestId, "failed", {
@@ -2832,7 +2849,7 @@ export function heartbeatService(db: Db) {
       if (shouldRetry) {
         const agent = await getAgent(run.agentId);
         if (agent) {
-          retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, now);
+          retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, now, isGhostClaim ? "ghost_run_stale_claim" : "process_lost");
         }
       } else {
         await releaseIssueExecutionAndPromote(finalizedRun);
@@ -2850,6 +2867,7 @@ export function heartbeatService(db: Db) {
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
           ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
+          ...(isGhostClaim ? { ghostClaim: true } : {}),
         },
       });
 
@@ -2866,12 +2884,42 @@ export function heartbeatService(db: Db) {
   }
 
   async function resumeQueuedRuns() {
-    const queuedRuns = await db
+    // Pre-cancel queued runs whose issue is already done/cancelled
+    const allQueued = await db
+      .select({
+        id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"));
+
+    for (const run of allQueued) {
+      const ctx = parseObject(run.contextSnapshot);
+      const issueId = readNonEmptyString(ctx.issueId);
+      if (!issueId) continue;
+      const [issueRow] = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .limit(1);
+      if (issueRow && (issueRow.status === "done" || issueRow.status === "cancelled")) {
+        await cancelRunInternal(run.id, `Cancelled because the associated issue is ${issueRow.status}`);
+        // Clear executionRunId on the issue
+        await db
+          .update(issues)
+          .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null, updatedAt: new Date() })
+          .where(eq(issues.executionRunId, run.id));
+      }
+    }
+
+    // Now resume legitimate queued runs
+    const remainingQueued = await db
       .select({ agentId: heartbeatRuns.agentId })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.status, "queued"));
 
-    const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
+    const agentIds = [...new Set(remainingQueued.map((r) => r.agentId))];
     for (const agentId of agentIds) {
       await startNextQueuedRunForAgent(agentId);
     }
@@ -4566,12 +4614,31 @@ export function heartbeatService(db: Db) {
           .select({
             id: issues.id,
             companyId: issues.companyId,
+            status: issues.status,
             executionRunId: issues.executionRunId,
             executionAgentNameKey: issues.executionAgentNameKey,
           })
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
           .then((rows) => rows[0] ?? null);
+
+        // Skip wakeup for done/cancelled issues — prevents ghost queued runs
+        if (issue && (issue.status === "done" || issue.status === "cancelled")) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "issue_already_closed",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          return { kind: "skipped" as const };
+        }
 
         if (!issue) {
           await tx.insert(agentWakeupRequests).values({
@@ -5383,8 +5450,9 @@ export function heartbeatService(db: Db) {
 
     cancelRun: (runId: string) => cancelRunInternal(runId),
 
-    cancelRunsForIssue: async (issueId: string, reason?: string) => {
+    cancelRunsForIssue: async (issueId: string, reason?: string, excludeRunId?: string) => {
       // Fix for #3168: cancel all queued/running runs associated with a closed issue
+      // excludeRunId: skip the run that is completing the issue (prevents self-cancel)
       const staleRuns = await db
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
@@ -5394,10 +5462,21 @@ export function heartbeatService(db: Db) {
             sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
           ),
         );
-      for (const run of staleRuns) {
+      const filtered = excludeRunId ? staleRuns.filter((r) => r.id !== excludeRunId) : staleRuns;
+      for (const run of filtered) {
         await cancelRunInternal(run.id, reason ?? "Cancelled because the associated issue was closed");
+        // Clear executionRunId on the issue so it doesn't appear as a stuck ghost run
+        await db
+          .update(issues)
+          .set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: new Date(),
+          })
+          .where(and(eq(issues.executionRunId, run.id)));
       }
-      return staleRuns.length;
+      return filtered.length;
     },
 
     cancelActiveForAgent: (agentId: string) => cancelActiveForAgentInternal(agentId),

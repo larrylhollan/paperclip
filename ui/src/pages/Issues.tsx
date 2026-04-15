@@ -26,6 +26,8 @@ export function buildIssuesSearchUrl(currentHref: string, search: string): strin
   }
 
   return `${url.pathname}${url.search}${url.hash}`;
+}
+
 const DEFAULT_ACTIVE_STATUS = "backlog,todo,in_progress,in_review,blocked";
 const ALL_STATUSES = ["backlog", "todo", "in_progress", "blocked", "done", "cancelled"] as const;
 

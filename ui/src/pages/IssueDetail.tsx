@@ -76,6 +76,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -91,6 +92,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Copy,
   EyeOff,
   Hexagon,
   ListTree,
@@ -101,6 +103,7 @@ import {
   Paperclip,
   Plus,
   Repeat,
+  SlidersHorizontal,
   Trash2,
 } from "lucide-react";
 import {
@@ -983,15 +986,6 @@ export function IssueDetail() {
     enabled: !!resolvedCompanyId && !!issue?.id,
     placeholderData: keepPreviousDataForSameQueryTail<Issue[]>(issue?.id ?? "pending"),
   });
-
-  // Filter out runs already shown by the live widget to avoid duplication
-  const timelineRuns = useMemo(() => {
-    const liveIds = new Set<string>();
-    for (const r of liveRuns ?? []) liveIds.add(r.id);
-    if (activeRun) liveIds.add(activeRun.id);
-    if (liveIds.size === 0) return linkedRuns ?? [];
-    return (linkedRuns ?? []).filter((r) => !liveIds.has(r.runId));
-  }, [linkedRuns, liveRuns, activeRun]);
 
   const { data: allIssues } = useQuery({
     queryKey: queryKeys.issues.list(selectedCompanyId!),

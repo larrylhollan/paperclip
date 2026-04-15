@@ -291,6 +291,8 @@ function buildExecutionStageWakeup(input: {
   }
 
   return null;
+}
+
 type RawJitSignerPayload = {
   fetchUrl?: string;
   fetch_url?: string;
@@ -1838,7 +1840,7 @@ export function issueRoutes(
       // Awaited (not fire-and-forget) so the PATCH doesn't return while stale runs
       // are still queued — prevents zombie live-run buildup during bulk cancels.
       try {
-        await heartbeat.cancelRunsForIssue(issue.id, `Cancelled because issue was ${issue.status}`);
+        await heartbeat.cancelRunsForIssue(issue.id, `Cancelled because issue was ${issue.status}`, actor.runId ?? undefined);
       } catch (err) {
         logger.warn({ err, issueId: issue.id }, "failed to cancel runs on issue close");
       }
@@ -2127,35 +2129,36 @@ export function issueRoutes(
           });
         }
 
-      // Skip @-mention wakes for TG-synced comments (conversation is live in OpenClaw)
-      const isTgSync = commentBody?.startsWith("[tg-sync]");
-      if (!isTgSync) {
-        let mentionedIds: string[] = [];
-        try {
-          mentionedIds = await svc.findMentionedAgents(issue.companyId, commentBody);
-        } catch (err) {
-          logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
-        }
+        // Skip @-mention wakes for TG-synced comments (conversation is live in OpenClaw)
+        const isTgSync = commentBody?.startsWith("[tg-sync]");
+        if (!isTgSync) {
+          let mentionedIds: string[] = [];
+          try {
+            mentionedIds = await svc.findMentionedAgents(issue.companyId, commentBody);
+          } catch (err) {
+            logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
+          }
 
-        for (const mentionedId of mentionedIds) {
-          if (actor.actorType === "agent" && actor.actorId === mentionedId) continue;
-          addWakeup(mentionedId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "issue_comment_mentioned",
-            payload: { issueId: id, commentId: comment.id },
-            requestedByActorType: actor.actorType,
-            requestedByActorId: actor.actorId,
-            contextSnapshot: {
-              issueId: id,
-              taskId: id,
-              commentId: comment.id,
-              wakeCommentId: comment.id,
-              wakeCommentBody: comment.body,
-              wakeReason: "issue_comment_mentioned",
-              source: "comment.mention",
-            },
-          });
+          for (const mentionedId of mentionedIds) {
+            if (actor.actorType === "agent" && actor.actorId === mentionedId) continue;
+            addWakeup(mentionedId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_comment_mentioned",
+              payload: { issueId: id, commentId: comment.id },
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              contextSnapshot: {
+                issueId: id,
+                taskId: id,
+                commentId: comment.id,
+                wakeCommentId: comment.id,
+                wakeCommentBody: comment.body,
+                wakeReason: "issue_comment_mentioned",
+                source: "comment.mention",
+              },
+            });
+          }
         }
       }
 
@@ -3337,8 +3340,10 @@ export function issueRoutes(
       });
 
       // Wake the assigned agent so it picks up the new credentials.
+      // Skip wake if the issue is already closed — avoids phantom requeue on done/cancelled issues.
       const assigneeId = issue.assigneeAgentId;
-      if (assigneeId) {
+      const isIssueClosed = issue.status === "done" || issue.status === "cancelled";
+      if (assigneeId && !isIssueClosed) {
         heartbeat
           .wakeup(assigneeId, {
             source: "automation",
@@ -3624,8 +3629,10 @@ export function issueRoutes(
     });
 
     // Wake the assigned agent so it picks up the new credentials.
+    // Skip wake if the issue is already closed — avoids phantom requeue on done/cancelled issues.
     const assigneeId = issue.assigneeAgentId;
-    if (assigneeId) {
+    const isIssueClosed = issue.status === "done" || issue.status === "cancelled";
+    if (assigneeId && !isIssueClosed) {
       heartbeat
         .wakeup(assigneeId, {
           source: "automation",
