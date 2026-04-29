@@ -19,3 +19,9 @@ export { llmRoutes } from "./llms.js";
 export { accessRoutes } from "./access.js";
 export { instanceSettingsRoutes } from "./instance-settings.js";
 export { instanceDatabaseBackupRoutes } from "./instance-database-backups.js";
+export {
+  jitPreApprovalRoutes,
+  jitQuickActionRoutes,
+} from "./jit-pre-approvals.js";
+export { jitExecTokenRoutes } from "./jit-exec-token.js";
+export { jitTelegramWebhookRoutes } from "./jit-telegram-webhook.js";

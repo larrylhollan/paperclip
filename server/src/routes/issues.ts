@@ -1,9 +1,12 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
+import { readFileSync } from "node:fs";
+import { fetchWithRetry } from "../jit-fetch-retry.js";
 import multer from "multer";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
-import { issueExecutionDecisions } from "@paperclipai/db";
+import { issueExecutionDecisions, approvals as approvalsTable } from "@paperclipai/db";
+import { and, eq as drizzleEq, sql } from "drizzle-orm";
 import {
   addIssueCommentSchema,
   acceptIssueThreadInteractionSchema,
@@ -40,6 +43,7 @@ import {
   accessService,
   agentService,
   companyService,
+  approvalService,
   executionWorkspaceService,
   goalService,
   heartbeatService,
@@ -82,6 +86,13 @@ import {
   parseIssueExecutionState,
 } from "../services/issue-execution-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+import { syncJitPreApprovals } from "../services/jit-requirements-parser.js";
+import { revokeCredentialsOnIssueClose } from "../services/jit-credential-revocation.js";
+import { sendExecTokenApprovalNotification } from "../services/jit-notification.js";
+import { getJitTarget, listJitTargets, loadJitTargetRegistry, jitIssuanceRequestSchema } from "../jit-target-registry.js";
+import { createIssuanceId, storeIssuance, resolveIssuance, initIssuanceStore } from "../jit-issuance-store.js";
+import { computeJitApprovalHash } from "../jit-approval-hash.js";
+import { generateApprovalTicket } from "../jit-approval-ticket.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -383,6 +394,224 @@ function buildExecutionStageWakeup(input: {
   return null;
 }
 
+type RawJitSignerPayload = {
+  fetchUrl?: string;
+  fetch_url?: string;
+  principal?: string;
+  ttlMinutes?: number;
+  ttl_minutes?: number;
+  targetHost?: string;
+  target_host?: string;
+  sshHost?: string;
+  ssh_host?: string;
+  sshUser?: string;
+  ssh_user?: string;
+  certId?: string;
+  cert_id?: string;
+  issuedAt?: string;
+  issued_at?: string;
+  expiresAt?: string;
+  expires_at?: string;
+  issuedOptions?: Record<string, unknown>;
+  issued_options?: Record<string, unknown>;
+  options?: Record<string, unknown>;
+};
+
+// ── Agent self-provision policy ──────────────────────────────────────
+// Controls which project + target combinations allow agents to self-provision
+// JIT SSH tokens without board approval. Configured via env var:
+//
+//   JIT_AGENT_SELF_PROVISION_POLICY='{"rules":[
+//     {"projectId":"<uuid>","targets":["pc.int"],"maxTtlMinutes":120}
+//   ]}'
+//
+// If the env var is unset or empty, agent self-provisioning is disabled entirely.
+
+interface SelfProvisionRule {
+  projectId: string;
+  targets: string[];
+  maxTtlMinutes?: number;
+  principal?: string;
+}
+
+interface SelfProvisionPolicy {
+  rules: SelfProvisionRule[];
+}
+
+let cachedSelfProvisionPolicy: SelfProvisionPolicy | null | undefined = undefined;
+
+function loadSelfProvisionPolicy(): SelfProvisionPolicy | null {
+  if (cachedSelfProvisionPolicy !== undefined) return cachedSelfProvisionPolicy;
+  const raw = process.env.JIT_AGENT_SELF_PROVISION_POLICY?.trim();
+  if (!raw) {
+    cachedSelfProvisionPolicy = null;
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as SelfProvisionPolicy;
+    if (!Array.isArray(parsed.rules)) {
+      cachedSelfProvisionPolicy = null;
+      return null;
+    }
+    cachedSelfProvisionPolicy = parsed;
+    return parsed;
+  } catch {
+    cachedSelfProvisionPolicy = null;
+    return null;
+  }
+}
+
+/**
+ * Check whether agent self-provisioning is allowed for the given project + target.
+ * Returns the matching rule if found, null otherwise.
+ */
+function matchSelfProvisionPolicy(projectId: string | null, target: string | null): SelfProvisionRule | null {
+  const policy = loadSelfProvisionPolicy();
+  if (!policy || !projectId) return null;
+  for (const rule of policy.rules) {
+    if (rule.projectId === projectId && (!target || rule.targets.includes(target))) {
+      return rule;
+    }
+  }
+  return null;
+}
+
+/** Reset cached policy (for tests). */
+export function resetSelfProvisionPolicyCache(): void {
+  cachedSelfProvisionPolicy = undefined;
+}
+
+function readAgentAccessBearerToken(): string | undefined {
+  const inlineToken = process.env.AGENT_ACCESS_BEARER_TOKEN?.trim();
+  if (inlineToken) return inlineToken;
+
+  const tokenFile = process.env.AGENT_ACCESS_BEARER_TOKEN_FILE?.trim();
+  if (!tokenFile) return undefined;
+
+  try {
+    const fileToken = readFileSync(tokenFile, "utf8").trim();
+    return fileToken || undefined;
+  } catch (err) {
+    logger.warn({ err, tokenFile }, "failed to read agent-access bearer token file");
+    return undefined;
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+function omitUndefined<T extends Record<string, unknown>>(value: T): T {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
+}
+
+function normalizeJitSignerPayload(
+  rawTokenPayload: RawJitSignerPayload,
+  issuanceReq: z.infer<typeof jitIssuanceRequestSchema>,
+  targetLabel: string,
+) {
+  const fetchUrl = rawTokenPayload.fetch_url ?? rawTokenPayload.fetchUrl;
+  const ttlMinutes = rawTokenPayload.ttl_minutes ?? rawTokenPayload.ttlMinutes;
+  const sshHost =
+    rawTokenPayload.ssh_host ??
+    rawTokenPayload.sshHost ??
+    rawTokenPayload.target_host ??
+    rawTokenPayload.targetHost;
+  const sshUser = rawTokenPayload.ssh_user ?? rawTokenPayload.sshUser;
+  const certId = rawTokenPayload.cert_id ?? rawTokenPayload.certId;
+  const issuedAt = rawTokenPayload.issued_at ?? rawTokenPayload.issuedAt;
+  const expiresAt = rawTokenPayload.expires_at ?? rawTokenPayload.expiresAt;
+  const signerIssuedOptions =
+    asRecord(rawTokenPayload.issued_options) ?? asRecord(rawTokenPayload.issuedOptions) ?? asRecord(rawTokenPayload.options);
+  const requestedIssuedOptions = omitUndefined({
+    ...(issuanceReq.options ?? {}),
+  });
+  const issuedOptions =
+    signerIssuedOptions ?? (Object.keys(requestedIssuedOptions).length > 0 ? requestedIssuedOptions : undefined);
+
+  return { fetchUrl, ttlMinutes, sshHost, sshUser, certId, issuedAt, expiresAt, issuedOptions, targetLabel };
+}
+
+function buildJitIssueCommentPayload(
+  rawTokenPayload: RawJitSignerPayload,
+  issuanceReq: z.infer<typeof jitIssuanceRequestSchema>,
+  targetLabel: string,
+  issuanceId: string,
+  connectionGuide?: string,
+) {
+  const n = normalizeJitSignerPayload(rawTokenPayload, issuanceReq, targetLabel);
+
+  return omitUndefined({
+    type: "jit-ssh-token",
+    schema_version: 3,
+    target: issuanceReq.target,
+    target_label: targetLabel,
+    issuance_id: issuanceId,
+    principal: rawTokenPayload.principal ?? issuanceReq.principal,
+    ttl_minutes: n.ttlMinutes,
+    ssh_host: n.sshHost,
+    ssh_user: n.sshUser,
+    cert_id: n.certId,
+    issued_at: n.issuedAt,
+    expires_at: n.expiresAt,
+    issued_options: n.issuedOptions,
+    connection_guide: connectionGuide,
+    // Legacy aliases retained for older agents / helpers while the canonical
+    // snake_case schema rolls out.
+    targetLabel: targetLabel,
+    issuanceId,
+    ttlMinutes: n.ttlMinutes,
+    targetHost: n.sshHost,
+    sshHost: n.sshHost,
+    sshUser: n.sshUser,
+    certId: n.certId,
+    issuedAt: n.issuedAt,
+    expiresAt: n.expiresAt,
+    issuedOptions: n.issuedOptions,
+    connectionGuide: connectionGuide,
+  });
+}
+
+function buildJitHttpResponsePayload(
+  rawTokenPayload: RawJitSignerPayload,
+  issuanceReq: z.infer<typeof jitIssuanceRequestSchema>,
+  targetLabel: string,
+  connectionGuide?: string,
+) {
+  const n = normalizeJitSignerPayload(rawTokenPayload, issuanceReq, targetLabel);
+
+  return omitUndefined({
+    type: "jit-ssh-token",
+    schema_version: 3,
+    target: issuanceReq.target,
+    target_label: targetLabel,
+    fetch_url: n.fetchUrl,
+    principal: rawTokenPayload.principal ?? issuanceReq.principal,
+    ttl_minutes: n.ttlMinutes,
+    ssh_host: n.sshHost,
+    ssh_user: n.sshUser,
+    cert_id: n.certId,
+    issued_at: n.issuedAt,
+    expires_at: n.expiresAt,
+    issued_options: n.issuedOptions,
+    connection_guide: connectionGuide,
+    // Legacy aliases retained for older agents / helpers while the canonical
+    // snake_case schema rolls out.
+    targetLabel: targetLabel,
+    fetchUrl: n.fetchUrl,
+    ttlMinutes: n.ttlMinutes,
+    targetHost: n.sshHost,
+    sshHost: n.sshHost,
+    sshUser: n.sshUser,
+    certId: n.certId,
+    issuedAt: n.issuedAt,
+    expiresAt: n.expiresAt,
+    issuedOptions: n.issuedOptions,
+    connectionGuide: connectionGuide,
+  });
+}
+
 export function issueRoutes(
   db: Db,
   storage: StorageService,
@@ -399,6 +628,7 @@ export function issueRoutes(
   } = {},
 ) {
   const router = Router();
+  initIssuanceStore(db);
   const svc = issueService(db);
   const access = accessService(db);
   const heartbeat = heartbeatService(db, {
@@ -412,6 +642,7 @@ export function issueRoutes(
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
   const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
+  const approvalsSvc = approvalService(db);
   const workProductsSvc = workProductService(db);
   const documentsSvc = documentService(db);
   const issueReferencesSvc = issueReferenceService(db);
@@ -1856,6 +2087,9 @@ export function issueRoutes(
       requestedByActorId: actor.actorId,
     });
 
+    void syncJitPreApprovals(db, issue.id, issue.description).catch((err) =>
+      logger.warn({ err, issueId: issue.id }, "failed to sync JIT pre-approvals on issue create"));
+
     res.status(201).json({
       ...issue,
       relatedWork: referenceSummary,
@@ -2243,6 +2477,29 @@ export function issueRoutes(
     }
     await routinesSvc.syncRunStatusForIssue(issue.id);
 
+    // Revoke JIT credentials when issue transitions to done/cancelled
+    const isClosing =
+      (issue.status === "done" || issue.status === "cancelled") &&
+      existing.status !== "done" &&
+      existing.status !== "cancelled";
+    if (isClosing) {
+      void revokeCredentialsOnIssueClose(db, issue.id, issue.status).catch((err) =>
+        logger.warn({ err, issueId: issue.id }, "failed to revoke JIT credentials on issue close"));
+      // Fix for #3168: cancel any queued/running runs tied to this issue
+      // Awaited (not fire-and-forget) so the PATCH doesn't return while stale runs
+      // are still queued — prevents zombie live-run buildup during bulk cancels.
+      try {
+        await heartbeat.cancelRunsForIssue(issue.id, `Cancelled because issue was ${issue.status}`, actor.runId ?? undefined);
+      } catch (err) {
+        logger.warn({ err, issueId: issue.id }, "failed to cancel runs on issue close");
+      }
+    }
+
+    if (req.body.description !== undefined) {
+      void syncJitPreApprovals(db, issue.id, issue.description).catch((err) =>
+        logger.warn({ err, issueId: issue.id }, "failed to sync JIT pre-approvals on issue update"));
+    }
+
     if (actor.runId) {
       await heartbeat.reportRunActivity(actor.runId).catch((err) =>
         logger.warn({ err, runId: actor.runId }, "failed to clear detached run warning after issue activity"));
@@ -2591,31 +2848,36 @@ export function issueRoutes(
           });
         }
 
-        let mentionedIds: string[] = [];
-        try {
-          mentionedIds = await svc.findMentionedAgents(issue.companyId, commentBody);
-        } catch (err) {
-          logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
-        }
+        // Skip @-mention wakes for TG-synced comments (conversation is live in OpenClaw)
+        const isTgSync = commentBody?.startsWith("[tg-sync]");
+        if (!isTgSync) {
+          let mentionedIds: string[] = [];
+          try {
+            mentionedIds = await svc.findMentionedAgents(issue.companyId, commentBody);
+          } catch (err) {
+            logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
+          }
 
-        for (const mentionedId of mentionedIds) {
-          if (actor.actorType === "agent" && actor.actorId === mentionedId) continue;
-          addWakeup(mentionedId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "issue_comment_mentioned",
-            payload: { issueId: id, commentId: comment.id },
-            requestedByActorType: actor.actorType,
-            requestedByActorId: actor.actorId,
-            contextSnapshot: {
-              issueId: id,
-              taskId: id,
-              commentId: comment.id,
-              wakeCommentId: comment.id,
-              wakeReason: "issue_comment_mentioned",
-              source: "comment.mention",
-            },
-          });
+          for (const mentionedId of mentionedIds) {
+            if (actor.actorType === "agent" && actor.actorId === mentionedId) continue;
+            addWakeup(mentionedId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_comment_mentioned",
+              payload: { issueId: id, commentId: comment.id },
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              contextSnapshot: {
+                issueId: id,
+                taskId: id,
+                commentId: comment.id,
+                wakeCommentId: comment.id,
+                wakeCommentBody: comment.body,
+                wakeReason: "issue_comment_mentioned",
+                source: "comment.mention",
+              },
+            });
+          }
         }
       }
 
@@ -3508,6 +3770,10 @@ export function issueRoutes(
 
     // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
     void (async () => {
+      const isTgSync = req.body.body?.startsWith('[tg-sync]');
+      // Skip wake for synced comments - conversation is live in OpenClaw
+      if (isTgSync) return;
+
       const wakeups = new Map<string, Parameters<typeof heartbeat.wakeup>[1]>();
       const assigneeId = currentIssue.assigneeAgentId;
       const actorIsAgent = actor.actorType === "agent";
@@ -3534,6 +3800,7 @@ export function issueRoutes(
               taskId: currentIssue.id,
               commentId: comment.id,
               wakeCommentId: comment.id,
+              wakeCommentBody: comment.body,
               source: "issue.comment.reopen",
               wakeReason: "issue_reopened_via_comment",
               reopenedFrom: reopenFromStatus,
@@ -3560,6 +3827,7 @@ export function issueRoutes(
               taskId: currentIssue.id,
               commentId: comment.id,
               wakeCommentId: comment.id,
+              wakeCommentBody: comment.body,
               source: "issue.comment",
               wakeReason: "issue_commented",
               ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
@@ -3591,6 +3859,7 @@ export function issueRoutes(
             taskId: id,
             commentId: comment.id,
             wakeCommentId: comment.id,
+            wakeCommentBody: comment.body,
             wakeReason: "issue_comment_mentioned",
             source: "comment.mention",
           },
@@ -3880,6 +4149,616 @@ export function issueRoutes(
     });
 
     res.json({ ok: true });
+  });
+
+  // ── JIT target list ────────────────────────────────────────────────
+  // Returns the allowlisted target machines with labels and defaults so
+  // the UI can populate the JIT SSH token request form.
+  router.get("/jit-targets", (_req, res) => {
+    const registry = loadJitTargetRegistry();
+    const targets = Object.entries(registry).map(([name, entry]) => ({
+      name,
+      label: entry.label,
+      defaultPrincipal: entry.defaultPrincipal,
+      defaultTtlMinutes: entry.defaultTtlMinutes,
+    }));
+    res.json(targets);
+  });
+
+  // ── JIT SSH token provisioning (two-phase approval flow) ───────────
+  // Phase A (no approvalId): creates a pending approval record, returns 202.
+  // Phase B (with approvalId): validates the approved approval, signs the
+  //   certificate, stores the issuance, and wakes the agent.
+  const JIT_APPROVAL_TTL_MINUTES = 10;
+
+  router.post("/issues/:id/jit-ssh-token", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+
+    // Board (human) users and assignee agents may request JIT SSH tokens.
+    // Agents may only self-provision for issues assigned to them AND only when
+    // a matching JIT_AGENT_SELF_PROVISION_POLICY rule exists for the issue's
+    // project + requested target. This prevents arbitrary agent SSH access.
+    const isAssigneeAgent =
+      req.actor.type === "agent" &&
+      req.actor.agentId != null &&
+      issue.assigneeAgentId === req.actor.agentId;
+
+    if (req.actor.type !== "board" && !isAssigneeAgent) {
+      res.status(403).json({ error: "Only board users or the assigned agent can provision JIT SSH tokens" });
+      return;
+    }
+
+    // For agent self-provisioning, enforce project-scoped policy.
+    // Without a matching policy rule, agents cannot self-provision even if assigned.
+    if (isAssigneeAgent) {
+      const requestedTarget = (req.body as Record<string, unknown>)?.target;
+      const policyMatch = matchSelfProvisionPolicy(issue.projectId, typeof requestedTarget === "string" ? requestedTarget : null);
+      if (!policyMatch) {
+        res.status(403).json({
+          error: "Agent self-provisioning is not enabled for this project/target combination. A board user must provision the token.",
+          projectId: issue.projectId,
+          target: requestedTarget,
+        });
+        return;
+      }
+    }
+
+    // Parse and validate the structured issuance request.
+    const parsed = jitIssuanceRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Invalid issuance request", details: parsed.error.flatten() });
+      return;
+    }
+    const issuanceReq = parsed.data;
+
+    // Look up the target in the allowlisted registry.
+    const target = getJitTarget(issuanceReq.target);
+    if (!target) {
+      res.status(400).json({
+        error: `Unknown target machine "${issuanceReq.target}"`,
+        allowedTargets: listJitTargets(),
+      });
+      return;
+    }
+
+    let requestedPrincipal = issuanceReq.principal ?? target.defaultPrincipal;
+    let requestedTtlMinutes = issuanceReq.ttlMinutes ?? target.defaultTtlMinutes;
+
+    // Enforce maxTtlMinutes and principal from self-provision policy (if agent self-provisioning).
+    if (isAssigneeAgent) {
+      const policyRule = matchSelfProvisionPolicy(issue.projectId, issuanceReq.target);
+      if (policyRule?.maxTtlMinutes && requestedTtlMinutes > policyRule.maxTtlMinutes) {
+        requestedTtlMinutes = policyRule.maxTtlMinutes;
+      }
+      // If the policy specifies a principal and the agent didn't explicitly request one, use it
+      if (policyRule?.principal && !issuanceReq.principal) {
+        requestedPrincipal = policyRule.principal;
+      }
+    }
+
+    const paramsHash = computeJitApprovalHash({
+      issueId: id,
+      target: issuanceReq.target,
+      principal: requestedPrincipal,
+      ttlMinutes: requestedTtlMinutes,
+      assigneeAgentId: issue.assigneeAgentId ?? null,
+    });
+
+    // ── Phase A: Request approval ──────────────────────────────────
+    const approvalId = req.body.approvalId as string | undefined;
+    if (!approvalId) {
+      const actor = getActorInfo(req);
+      const approval = await approvalsSvc.create(issue.companyId, {
+        type: "jit_ssh_token",
+        requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
+        requestedByAgentId: actor.actorType === "agent" ? actor.actorId : null,
+        payload: {
+          issueId: id,
+          target: issuanceReq.target,
+          principal: requestedPrincipal,
+          ttlMinutes: requestedTtlMinutes,
+          assigneeAgentId: issue.assigneeAgentId ?? null,
+          paramsHash,
+          options: issuanceReq.options ?? {},
+        },
+      });
+      await issueApprovalsSvc.link(id, approval.id, {
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      });
+
+      // Auto-approve for board users and assignee agents: skip the 202 pending flow and fall through to Phase B.
+      if (req.actor.type === "board" || isAssigneeAgent) {
+        const decidedByUserId = actor.actorType === "user" ? actor.actorId : "";
+        const decisionNote = isAssigneeAgent
+          ? "Auto-approved: assignee agent self-provision"
+          : "Auto-approved: board user JIT request";
+        await approvalsSvc.approve(approval.id, decidedByUserId, decisionNote);
+        // Fall through to Phase B with the now-approved approval.
+        (req.body as any).approvalId = approval.id;
+      } else {
+        res.status(202).json({
+          status: "pending_approval",
+          approvalId: approval.id,
+          paramsHash,
+        });
+        return;
+      }
+    }
+
+    // ── Phase B: Execute after approval ────────────────────────────
+    const resolvedApprovalId = (req.body as any).approvalId ?? approvalId;
+    const approval = await approvalsSvc.getById(resolvedApprovalId);
+    if (!approval) {
+      res.status(404).json({ error: "Approval not found" });
+      return;
+    }
+
+    if (approval.type !== "jit_ssh_token") {
+      res.status(409).json({ error: "Approval is not a JIT SSH token approval" });
+      return;
+    }
+
+    if (approval.status !== "approved") {
+      res.status(409).json({ error: `Approval is not approved (current status: ${approval.status})` });
+      return;
+    }
+
+    // Verify one-time use: check consumedAt in payload.
+    const approvalPayload = approval.payload as Record<string, unknown>;
+    if (approvalPayload.consumedAt) {
+      res.status(409).json({ error: "Approval has already been consumed" });
+      return;
+    }
+
+    // Verify the approval hasn't expired (decidedAt + TTL window).
+    if (approval.decidedAt) {
+      const decidedAtMs = new Date(approval.decidedAt).getTime();
+      const expiresAtMs = decidedAtMs + JIT_APPROVAL_TTL_MINUTES * 60 * 1000;
+      if (Date.now() > expiresAtMs) {
+        res.status(409).json({ error: "Approval has expired" });
+        return;
+      }
+    }
+
+    // Verify the params hash still matches (parameters haven't changed).
+    if (approvalPayload.paramsHash !== paramsHash) {
+      res.status(409).json({ error: "Issuance parameters have changed since approval was granted" });
+      return;
+    }
+
+    try {
+      const signHeaders: Record<string, string> = { "Content-Type": "application/json" };
+      const agentAccessBearerToken = readAgentAccessBearerToken();
+      if (agentAccessBearerToken) {
+        signHeaders.Authorization = `Bearer ${agentAccessBearerToken}`;
+      }
+
+      // Generate approval ticket if secret is configured
+      let approvalTicket: ReturnType<typeof generateApprovalTicket> | undefined;
+      if (process.env.AGENT_ACCESS_TICKET_SECRET) {
+        approvalTicket = generateApprovalTicket({
+          approvalId: resolvedApprovalId,
+          approvedByUserId: (approval as any).decidedByUserId ?? "",
+          issueId: id,
+          paramsHash,
+          approvedAt: new Date((approval as any).decidedAt).toISOString(),
+        });
+      }
+
+      const signRes = await fetchWithRetry(`${target.issuerBaseUrl}/sign-for-issue`, {
+        method: "POST",
+        headers: signHeaders,
+        body: JSON.stringify({
+          issueId: id,
+          companyId: issue.companyId,
+          target: issuanceReq.target,
+          principal: requestedPrincipal,
+          ttlMinutes: requestedTtlMinutes,
+          ttl_minutes: requestedTtlMinutes,
+          assigneeAgentId: issue.assigneeAgentId ?? "",
+          ...(issuanceReq.options ?? {}),
+          ...(approvalTicket ? { approvalTicket } : {}),
+        }),
+      }, { label: "jit-ssh-token" });
+
+      if (!signRes.ok) {
+        const errorBody = await signRes.text().catch(() => "");
+        logger.warn({ issueId: id, target: issuanceReq.target, status: signRes.status, body: errorBody }, "agent-access sign-for-issue failed");
+        res.status(signRes.status >= 500 ? 502 : signRes.status).json({
+          error: `Agent-access service returned ${signRes.status}`,
+          detail: errorBody || undefined,
+        });
+        return;
+      }
+
+      const tokenPayload = (await signRes.json()) as RawJitSignerPayload;
+      const httpResponsePayload = buildJitHttpResponsePayload(tokenPayload, issuanceReq, target.label, target.connectionGuide);
+      if (typeof httpResponsePayload.fetch_url !== "string" || httpResponsePayload.fetch_url.length === 0) {
+        logger.warn({ issueId: id, target: issuanceReq.target, tokenPayload }, "agent-access sign-for-issue returned no fetch_url");
+        res.status(502).json({ error: "Agent-access service returned an invalid token payload" });
+        return;
+      }
+
+      // Mark the approval as consumed (one-time use) by storing consumedAt in the payload.
+      // We do this before storing the issuance to prevent double-spend on concurrent requests.
+      await db
+        .update(approvalsTable)
+        .set({ payload: { ...approvalPayload, consumedAt: new Date().toISOString() } })
+        .where(drizzleEq(approvalsTable.id, resolvedApprovalId));
+
+      // Store the full credential in the issuance store so agents can resolve it.
+      const issuanceId = createIssuanceId();
+      const requestedTtlMs = requestedTtlMinutes * 60 * 1000;
+      await storeIssuance(issuanceId, httpResponsePayload as unknown as Record<string, unknown>, id, requestedTtlMs);
+
+      const commentPayload = buildJitIssueCommentPayload(tokenPayload, issuanceReq, target.label, issuanceId, target.connectionGuide);
+
+      const structuredComment = [
+        "<!-- jit-ssh-token -->",
+        "```json",
+        JSON.stringify(commentPayload, null, 2),
+        "```",
+        "<!-- /jit-ssh-token -->",
+      ].join("\n");
+
+      const actor = getActorInfo(req);
+      const comment = await svc.addComment(id, structuredComment, {
+        userId: actor.actorType === "user" ? actor.actorId : undefined,
+        agentId: actor.actorType === "agent" ? actor.actorId : undefined,
+      });
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          commentId: comment.id,
+          bodySnippet: "jit-ssh-token provisioned",
+          identifier: issue.identifier,
+          issueTitle: issue.title,
+        },
+      });
+
+      // Wake the assigned agent so it picks up the new credentials.
+      // Skip wake if the issue is already closed — avoids phantom requeue on done/cancelled issues.
+      const assigneeId = issue.assigneeAgentId;
+      const isIssueClosed = issue.status === "done" || issue.status === "cancelled";
+      if (assigneeId && !isIssueClosed) {
+        heartbeat
+          .wakeup(assigneeId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "jit_ssh_token_provisioned",
+            payload: { issueId: id, commentId: comment.id, target: issuanceReq.target },
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: {
+              issueId: id,
+              taskId: id,
+              commentId: comment.id,
+              source: "issue.jit_ssh_token",
+              wakeReason: "jit_ssh_token_provisioned",
+            },
+          })
+          .catch((err) => logger.warn({ err, issueId: id, agentId: assigneeId }, "failed to wake agent after JIT SSH token"));
+      }
+
+      res.status(201).json({ comment, token: httpResponsePayload });
+    } catch (err) {
+      logger.error({ err, issueId: id }, "JIT SSH token provisioning failed");
+      res.status(502).json({ error: "Failed to reach agent-access service" });
+    }
+  });
+
+  // ── JIT exec token provisioning (two-phase approval flow) ──────────
+  // Issue-scoped exec requests follow the same assignee self-provision
+  // policy as SSH tokens. Matching project+target combinations auto-approve
+  // for the assigned agent; all other exec requests use the normal approval
+  // notification flow.
+  // Phase A (no approvalId): auto-approves or creates a pending approval.
+  // Phase B (with approvalId): validates the approved approval, signs the
+  //   JWT, stores issuance, posts comment, and wakes the agent.
+
+  function signExecJwt(claims: object, secret: string): string {
+    const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+    const payload = Buffer.from(JSON.stringify(claims)).toString("base64url");
+    const signature = createHmac("sha256", secret).update(`${header}.${payload}`).digest("base64url");
+    return `${header}.${payload}.${signature}`;
+  }
+
+  router.post("/issues/:id/jit-exec-token", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+
+    // Board users and assignee agents may request exec tokens.
+    const isAssigneeAgent =
+      req.actor.type === "agent" &&
+      req.actor.agentId != null &&
+      issue.assigneeAgentId === req.actor.agentId;
+
+    if (req.actor.type !== "board" && !isAssigneeAgent) {
+      res.status(403).json({ error: "Only board users or the assigned agent can request JIT exec tokens" });
+      return;
+    }
+
+    const { target, scopes, originSessionKey, originGatewayPort } = req.body as {
+      target?: string;
+      scopes?: string[];
+      originSessionKey?: string;
+      originGatewayPort?: number;
+    };
+    if (!target || typeof target !== "string") {
+      res.status(400).json({ error: "Missing required field: target" });
+      return;
+    }
+
+    const validScopes = scopes && Array.isArray(scopes) ? scopes : ["exec", "exec:script", "exec:stream"];
+    const selfProvisionRule = isAssigneeAgent
+      ? matchSelfProvisionPolicy(issue.projectId, target)
+      : null;
+
+    // ── Phase A: Request approval ──────────────────────────────────
+    const approvalId = req.body.approvalId as string | undefined;
+    if (!approvalId) {
+      const actor = getActorInfo(req);
+
+      // ── Dedup: reuse existing pending approval for same issue+agent+target ──
+      const existingPending = await db
+        .select()
+        .from(approvalsTable)
+        .where(
+          and(
+            drizzleEq(approvalsTable.companyId, issue.companyId),
+            drizzleEq(approvalsTable.type, "jit_exec_token"),
+            drizzleEq(approvalsTable.status, "pending"),
+            sql`${approvalsTable.payload}->>'issueId' = ${id}`,
+            sql`${approvalsTable.payload}->>'target' = ${target}`,
+            sql`${approvalsTable.createdAt} > now() - interval '15 minutes'`,
+          )
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+
+      if (existingPending) {
+        logger.info(
+          { approvalId: existingPending.id, issueId: id, target },
+          "Reusing existing pending exec token approval (dedup)",
+        );
+        res.status(202).json({
+          status: "pending_approval",
+          approvalId: existingPending.id,
+          deduplicated: true,
+        });
+        return;
+      }
+
+      const approval = await approvalsSvc.create(issue.companyId, {
+        type: "jit_exec_token",
+        requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
+        requestedByAgentId: actor.actorType === "agent" ? actor.actorId : null,
+        payload: {
+          issueId: id,
+          target,
+          scopes: validScopes,
+          assigneeAgentId: issue.assigneeAgentId ?? null,
+          ...(originSessionKey ? { originSessionKey } : {}),
+          ...(originGatewayPort ? { originGatewayPort } : {}),
+        },
+      });
+      await issueApprovalsSvc.link(id, approval.id, {
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      });
+
+      if (req.actor.type === "board" || selfProvisionRule) {
+        const decidedByUserId = actor.actorType === "user" ? actor.actorId : "";
+        const decisionNote = selfProvisionRule
+          ? "Auto-approved: assignee agent self-provision"
+          : "Auto-approved: board user exec request";
+        await approvalsSvc.approve(approval.id, decidedByUserId, decisionNote);
+        (req.body as any).approvalId = approval.id;
+      } else {
+        // Look up agent name for the notification
+        let agentName: string | undefined;
+        if (isAssigneeAgent && req.actor.agentId) {
+          const agent = await agentsSvc.getById(req.actor.agentId);
+          agentName = agent?.name ?? undefined;
+        }
+
+        // Await notification delivery so we can surface failures to the caller.
+        // The agent polling loop depends on Jeff seeing this notification.
+        const notifResult = await sendExecTokenApprovalNotification({
+          approvalId: approval.id,
+          issueIdentifier: issue.identifier ?? undefined,
+          issueTitle: issue.title,
+          target,
+          scopes: validScopes,
+          agentName,
+          agentId: isAssigneeAgent ? req.actor.agentId! : undefined,
+        });
+
+        res.status(202).json({
+          status: "pending_approval",
+          approvalId: approval.id,
+          notificationDelivered: notifResult.sent,
+          ...(notifResult.sent ? {} : { notificationError: notifResult.reason }),
+        });
+        return;
+      }
+    }
+
+    // ── Phase B: Execute after approval ────────────────────────────
+    const resolvedApprovalId = (req.body as any).approvalId ?? approvalId;
+    const approval = await approvalsSvc.getById(resolvedApprovalId);
+    if (!approval) {
+      res.status(404).json({ error: "Approval not found" });
+      return;
+    }
+
+    if (approval.type !== "jit_exec_token") {
+      res.status(409).json({ error: "Approval is not a JIT exec token approval" });
+      return;
+    }
+
+    if (approval.status !== "approved") {
+      res.status(409).json({ error: `Approval is not approved (current status: ${approval.status})` });
+      return;
+    }
+
+    const approvalPayload = approval.payload as Record<string, unknown>;
+    if (approvalPayload.consumedAt) {
+      res.status(409).json({ error: "Approval has already been consumed" });
+      return;
+    }
+
+    const approvedTarget = typeof approvalPayload.target === "string" ? approvalPayload.target : target;
+    const approvedScopes = Array.isArray(approvalPayload.scopes)
+      ? approvalPayload.scopes as string[]
+      : validScopes;
+
+    if (approval.decidedAt) {
+      const decidedAtMs = new Date(approval.decidedAt).getTime();
+      const expiresAtMs = decidedAtMs + JIT_APPROVAL_TTL_MINUTES * 60 * 1000;
+      if (Date.now() > expiresAtMs) {
+        res.status(409).json({ error: "Approval has expired" });
+        return;
+      }
+    }
+
+    const secret = process.env.REX_JWT_SECRET;
+    if (!secret) {
+      logger.error("REX_JWT_SECRET not configured — cannot issue exec tokens");
+      res.status(500).json({ error: "Exec token signing not configured" });
+      return;
+    }
+
+    const agentId = isAssigneeAgent ? req.actor.agentId! : (req.actor as any).userId ?? "board";
+    const now = Math.floor(Date.now() / 1000);
+    const ttlSeconds = 2 * 60 * 60; // 2 hours
+    const jti = randomUUID();
+    const expiresAt = new Date((now + ttlSeconds) * 1000).toISOString();
+
+    const claims = {
+      iss: "paperclip",
+      sub: `agent:${agentId}`,
+      aud: "rex-agent",
+      iat: now,
+      exp: now + ttlSeconds,
+      jti,
+      issue_id: id,
+      target: approvedTarget,
+      scopes: approvedScopes,
+    };
+
+    const token = signExecJwt(claims, secret);
+
+    // Mark approval as consumed before storing issuance to prevent double-spend.
+    await db
+      .update(approvalsTable)
+      .set({ payload: { ...approvalPayload, consumedAt: new Date().toISOString() } })
+      .where(drizzleEq(approvalsTable.id, resolvedApprovalId));
+
+    // Store issuance for tracking and revocation.
+    const issuanceId = createIssuanceId();
+    const ttlMs = ttlSeconds * 1000;
+    await storeIssuance(issuanceId, { type: "exec_token", jti, exp: claims.exp, target: approvedTarget, agentId }, id, ttlMs);
+
+    // Post a metadata comment on the issue (NOT the token itself).
+    const commentPayload = {
+      type: "jit-exec-token",
+      issuance_id: issuanceId,
+      target: approvedTarget,
+      scopes: approvedScopes,
+      expires_at: expiresAt,
+      issued_to: claims.sub,
+    };
+
+    const structuredComment = [
+      "<!-- jit-exec-token -->",
+      "```json",
+      JSON.stringify(commentPayload, null, 2),
+      "```",
+      "<!-- /jit-exec-token -->",
+    ].join("\n");
+
+    const actor = getActorInfo(req);
+    const comment = await svc.addComment(id, structuredComment, {
+      userId: actor.actorType === "user" ? actor.actorId : undefined,
+      agentId: actor.actorType === "agent" ? actor.actorId : undefined,
+    });
+
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issue.id,
+      details: {
+        commentId: comment.id,
+        bodySnippet: "jit-exec-token provisioned",
+        identifier: issue.identifier,
+        issueTitle: issue.title,
+      },
+    });
+
+    // Wake the assigned agent so it picks up the new credentials.
+    // Skip wake if the issue is already closed — avoids phantom requeue on done/cancelled issues.
+    const assigneeId = issue.assigneeAgentId;
+    const isIssueClosed = issue.status === "done" || issue.status === "cancelled";
+    if (assigneeId && !isIssueClosed) {
+      heartbeat
+        .wakeup(assigneeId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "jit_exec_token_provisioned",
+          payload: { issueId: id, commentId: comment.id, target: approvedTarget },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: {
+            issueId: id,
+            taskId: id,
+            commentId: comment.id,
+            source: "issue.jit_exec_token",
+            wakeReason: "jit_exec_token_provisioned",
+          },
+        })
+        .catch((err) => logger.warn({ err, issueId: id, agentId: assigneeId }, "failed to wake agent after JIT exec token"));
+    }
+
+    res.status(201).json({ token, expiresAt, issuanceId });
+  });
+
+  // ── JIT issuance resolution ────────────────────────────────────────
+  // Agents resolve an opaque issuance_id to get the actual credential.
+  // One-time use: the entry is deleted after successful resolution.
+  router.post("/issuances/:id/resolve", async (req, res) => {
+    const issuanceId = req.params.id as string;
+
+    const entry = await resolveIssuance(issuanceId);
+    if (!entry) {
+      res.status(404).json({ error: "Issuance not found or already resolved" });
+      return;
+    }
+
+    res.json(entry.payload);
   });
 
   return router;

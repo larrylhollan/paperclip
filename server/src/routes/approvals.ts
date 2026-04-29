@@ -146,7 +146,18 @@ export function approvalRoutes(
     if (applied) {
       const linkedIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);
       const linkedIssueIds = linkedIssues.map((issue) => issue.id);
-      const primaryIssueId = linkedIssueIds[0] ?? null;
+
+      // Extract issueId from the approval payload as a fallback when no issues
+      // are linked (e.g. jit_exec_token_adhoc).  This mirrors the Telegram
+      // webhook path which already reads from the payload directly, ensuring
+      // the wake targets the originating issue session rather than falling
+      // back to a generic agent heartbeat.
+      const approvalPayload = approval.payload as Record<string, unknown> | null;
+      const payloadIssueId =
+        typeof approvalPayload?.issueId === "string" && approvalPayload.issueId.length > 0
+          ? approvalPayload.issueId
+          : null;
+      const primaryIssueId = linkedIssueIds[0] ?? payloadIssueId;
 
       await logActivity(db, {
         companyId: approval.companyId,

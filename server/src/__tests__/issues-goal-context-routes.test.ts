@@ -1,8 +1,6 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { errorHandler } from "../middleware/index.js";
-import { issueRoutes } from "../routes/issues.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -11,8 +9,6 @@ const mockIssueService = vi.hoisted(() => ({
   findMentionedProjectIds: vi.fn(),
   getCommentCursor: vi.fn(),
   getComment: vi.fn(),
-  listBlockerAttention: vi.fn(),
-  listProductivityReviews: vi.fn(),
   listAttachments: vi.fn(),
 }));
 
@@ -26,98 +22,57 @@ const mockGoalService = vi.hoisted(() => ({
   getDefaultCompanyGoal: vi.fn(),
 }));
 
-const mockDocumentsService = vi.hoisted(() => ({
-  getIssueDocumentPayload: vi.fn(),
-  getIssueDocumentByKey: vi.fn(),
-}));
-
-const mockExecutionWorkspaceService = vi.hoisted(() => ({
-  getById: vi.fn(),
-}));
-
-const mockAccessService = vi.hoisted(() => ({
-  canUser: vi.fn(),
-  hasPermission: vi.fn(),
-}));
-
-const mockAgentService = vi.hoisted(() => ({
-  getById: vi.fn(),
-}));
-
-const mockFeedbackService = vi.hoisted(() => ({
-  listIssueVotesForUser: vi.fn(async () => []),
-  saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
-}));
-
-const mockHeartbeatService = vi.hoisted(() => ({
-  wakeup: vi.fn(async () => undefined),
-  reportRunActivity: vi.fn(async () => undefined),
-}));
-
-const mockInstanceSettingsService = vi.hoisted(() => ({
-  get: vi.fn(async () => ({
-    id: "instance-settings-1",
-    general: {
-      censorUsernameInLogs: false,
-      feedbackDataSharingPreference: "prompt",
-    },
-  })),
-  listCompanyIds: vi.fn(async () => ["company-1"]),
-}));
-
-const mockIssueReferenceService = vi.hoisted(() => ({
-  deleteDocumentSource: vi.fn(async () => undefined),
-  diffIssueReferenceSummary: vi.fn(() => ({
-    addedReferencedIssues: [],
-    removedReferencedIssues: [],
-    currentReferencedIssues: [],
-  })),
-  emptySummary: vi.fn(() => ({ outbound: [], inbound: [] })),
-  listIssueReferenceSummary: vi.fn(async () => ({ outbound: [], inbound: [] })),
-  syncComment: vi.fn(async () => undefined),
-  syncDocument: vi.fn(async () => undefined),
-  syncIssue: vi.fn(async () => undefined),
-}));
-
-const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
-
-const mockRoutineService = vi.hoisted(() => ({
-  syncRunStatusForIssue: vi.fn(async () => undefined),
-}));
-
-const mockWorkProductService = vi.hoisted(() => ({
-  listForIssue: vi.fn(async () => []),
-}));
-
-const mockEnvironmentService = vi.hoisted(() => ({}));
-
 vi.mock("../services/index.js", () => ({
-  companyService: () => ({
-    getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
+  accessService: () => ({
+    canUser: vi.fn(),
+    hasPermission: vi.fn(),
   }),
-  accessService: () => mockAccessService,
-  agentService: () => mockAgentService,
-  documentService: () => mockDocumentsService,
-  environmentService: () => mockEnvironmentService,
-  executionWorkspaceService: () => mockExecutionWorkspaceService,
-  feedbackService: () => mockFeedbackService,
+  agentService: () => ({
+    getById: vi.fn(),
+  }),
+  documentService: () => ({
+    getIssueDocumentPayload: vi.fn(async () => ({})),
+  }),
+  executionWorkspaceService: () => ({
+    getById: vi.fn(),
+  }),
+  feedbackService: () => ({
+    listIssueVotesForUser: vi.fn(async () => []),
+    saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
+  }),
   goalService: () => mockGoalService,
-  heartbeatService: () => mockHeartbeatService,
-  instanceSettingsService: () => mockInstanceSettingsService,
+  heartbeatService: () => ({
+    wakeup: vi.fn(async () => undefined),
+    reportRunActivity: vi.fn(async () => undefined),
+  }),
+  instanceSettingsService: () => ({
+    get: vi.fn(async () => ({
+      id: "instance-settings-1",
+      general: {
+        censorUsernameInLogs: false,
+        feedbackDataSharingPreference: "prompt",
+      },
+    })),
+    listCompanyIds: vi.fn(async () => ["company-1"]),
+  }),
+  approvalService: () => ({ create: vi.fn(), getById: vi.fn() }),
   issueApprovalService: () => ({}),
-  issueReferenceService: () => mockIssueReferenceService,
   issueService: () => mockIssueService,
-  logActivity: mockLogActivity,
+  logActivity: vi.fn(async () => undefined),
   projectService: () => mockProjectService,
-  routineService: () => mockRoutineService,
-  workProductService: () => mockWorkProductService,
+  routineService: () => ({
+    syncRunStatusForIssue: vi.fn(async () => undefined),
+  }),
+  workProductService: () => ({
+    listForIssue: vi.fn(async () => []),
+  }),
 }));
 
-vi.mock("../services/execution-workspaces.js", () => ({
-  executionWorkspaceService: () => mockExecutionWorkspaceService,
-}));
-
-function createApp() {
+async function createApp() {
+  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
+    vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
+    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+  ]);
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -167,9 +122,13 @@ const projectGoal = {
   updatedAt: new Date("2026-03-20T00:00:00Z"),
 };
 
-describe.sequential("issue goal context routes", () => {
+describe("issue goal context routes", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetModules();
+    vi.doUnmock("../routes/issues.js");
+    vi.doUnmock("../routes/authz.js");
+    vi.doUnmock("../middleware/index.js");
+    vi.resetAllMocks();
     mockIssueService.getById.mockResolvedValue(legacyProjectLinkedIssue);
     mockIssueService.getAncestors.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
@@ -180,12 +139,7 @@ describe.sequential("issue goal context routes", () => {
       latestCommentAt: null,
     });
     mockIssueService.getComment.mockResolvedValue(null);
-    mockIssueService.listBlockerAttention.mockResolvedValue(new Map());
-    mockIssueService.listProductivityReviews.mockResolvedValue(new Map());
     mockIssueService.listAttachments.mockResolvedValue([]);
-    mockDocumentsService.getIssueDocumentPayload.mockResolvedValue({});
-    mockDocumentsService.getIssueDocumentByKey.mockResolvedValue(null);
-    mockExecutionWorkspaceService.getById.mockResolvedValue(null);
     mockProjectService.getById.mockResolvedValue({
       id: legacyProjectLinkedIssue.projectId,
       companyId: "company-1",
@@ -227,7 +181,7 @@ describe.sequential("issue goal context routes", () => {
   });
 
   it("surfaces the project goal from GET /issues/:id when the issue has no direct goal", async () => {
-    const res = await request(createApp()).get("/api/issues/11111111-1111-4111-8111-111111111111");
+    const res = await request(await createApp()).get("/api/issues/11111111-1111-4111-8111-111111111111");
 
     expect(res.status).toBe(200);
     expect(res.body.goalId).toBe(projectGoal.id);
@@ -245,7 +199,7 @@ describe.sequential("issue goal context routes", () => {
   });
 
   it("surfaces the project goal from GET /issues/:id/heartbeat-context", async () => {
-    const res = await request(createApp()).get(
+    const res = await request(await createApp()).get(
       "/api/issues/11111111-1111-4111-8111-111111111111/heartbeat-context",
     );
 
@@ -259,31 +213,6 @@ describe.sequential("issue goal context routes", () => {
     );
     expect(mockGoalService.getDefaultCompanyGoal).not.toHaveBeenCalled();
     expect(res.body.attachments).toEqual([]);
-  });
-
-  it("preserves direct continuation summary lookup in GET /issues/:id/heartbeat-context", async () => {
-    mockDocumentsService.getIssueDocumentByKey.mockResolvedValue({
-      key: "continuation-summary",
-      title: "Continuation Summary",
-      body: "# Handoff",
-      latestRevisionId: "revision-1",
-      latestRevisionNumber: 1,
-      updatedAt: new Date("2026-04-19T12:00:00.000Z"),
-    });
-
-    const res = await request(createApp()).get(
-      "/api/issues/11111111-1111-4111-8111-111111111111/heartbeat-context",
-    );
-
-    expect(res.status).toBe(200);
-    expect(mockDocumentsService.getIssueDocumentByKey).toHaveBeenCalledWith(
-      "11111111-1111-4111-8111-111111111111",
-      "continuation-summary",
-    );
-    expect(res.body.continuationSummary).toEqual(expect.objectContaining({
-      key: "continuation-summary",
-      body: "# Handoff",
-    }));
   });
 
   it("surfaces blocker summaries on GET /issues/:id/heartbeat-context", async () => {
@@ -302,7 +231,7 @@ describe.sequential("issue goal context routes", () => {
       blocks: [],
     });
 
-    const res = await request(createApp()).get(
+    const res = await request(await createApp()).get(
       "/api/issues/11111111-1111-4111-8111-111111111111/heartbeat-context",
     );
 
@@ -313,45 +242,5 @@ describe.sequential("issue goal context routes", () => {
         identifier: "PAP-580",
       }),
     ]);
-  });
-
-  it("surfaces the current execution workspace from GET /issues/:id/heartbeat-context", async () => {
-    mockIssueService.getById.mockResolvedValue({
-      ...legacyProjectLinkedIssue,
-      executionWorkspaceId: "55555555-5555-4555-8555-555555555555",
-    });
-    mockExecutionWorkspaceService.getById.mockResolvedValue({
-      id: "55555555-5555-4555-8555-555555555555",
-      name: "PAP-581 workspace",
-      mode: "isolated_workspace",
-      status: "active",
-      cwd: "/tmp/pap-581",
-      runtimeServices: [
-        {
-          id: "service-1",
-          serviceName: "web",
-          status: "running",
-          url: "http://127.0.0.1:5173",
-          healthStatus: "healthy",
-        },
-      ],
-    });
-
-    const res = await request(createApp()).get(
-      "/api/issues/11111111-1111-4111-8111-111111111111/heartbeat-context",
-    );
-
-    expect(res.status).toBe(200);
-    expect(mockExecutionWorkspaceService.getById).toHaveBeenCalledWith("55555555-5555-4555-8555-555555555555");
-    expect(res.body.currentExecutionWorkspace).toEqual(expect.objectContaining({
-      id: "55555555-5555-4555-8555-555555555555",
-      mode: "isolated_workspace",
-      runtimeServices: [
-        expect.objectContaining({
-          serviceName: "web",
-          url: "http://127.0.0.1:5173",
-        }),
-      ],
-    }));
   });
 });

@@ -79,23 +79,20 @@ import { StatusIcon } from "../components/StatusIcon";
 import { PriorityIcon } from "../components/PriorityIcon";
 import { ProductivityReviewBadge } from "../components/ProductivityReviewBadge";
 import { Identity } from "../components/Identity";
+import { IssueHeaderActions } from "../components/IssueHeaderActions";
 import { PluginSlotMount, PluginSlotOutlet, usePluginSlots } from "@/plugins/slots";
 import { PluginLauncherOutlet } from "@/plugins/launchers";
 import { Separator } from "@/components/ui/separator";
-import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
 import { formatIssueActivityAction } from "@/lib/activity-format";
 import { buildIssuePropertiesPanelKey } from "../lib/issue-properties-panel-key";
@@ -107,12 +104,14 @@ import {
   Archive,
   ArrowLeft,
   Check,
+  ChevronDown,
   ChevronRight,
   Copy,
   Eye,
   EyeOff,
   Hexagon,
   ListTree,
+  Loader2,
   MessageSquare,
   MoreHorizontal,
   MoreVertical,
@@ -1038,8 +1037,13 @@ export function IssueDetail() {
   const { pushToast } = useToastActions();
   const { isMobile } = useSidebar();
   const [moreOpen, setMoreOpen] = useState(false);
+  const [jitDialogOpen, setJitDialogOpen] = useState(false);
+  const [jitTarget, setJitTarget] = useState("work.int");
+  const [jitPrincipal, setJitPrincipal] = useState("");
+  const [jitTtl, setJitTtl] = useState("");
   const [copied, setCopied] = useState(false);
   const [mobilePropsOpen, setMobilePropsOpen] = useState(false);
+  const [mobileActionsOpen, setMobileActionsOpen] = useState(false);
   const [detailTab, setDetailTab] = useState("chat");
   const [handoffFocusSignal, setHandoffFocusSignal] = useState(0);
   const [pendingApprovalAction, setPendingApprovalAction] = useState<{
@@ -1047,6 +1051,9 @@ export function IssueDetail() {
     action: "approve" | "reject";
   } | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [secondaryOpen, setSecondaryOpen] = useState({
+    approvals: false,
+  });
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [attachmentDragActive, setAttachmentDragActive] = useState(false);
   const [galleryOpen, setGalleryOpen] = useState(false);
@@ -1184,6 +1191,12 @@ export function IssueDetail() {
     enabled: !!resolvedCompanyId,
     refetchInterval: 5000,
     placeholderData: keepPreviousDataForSameQueryTail<LiveRunForIssue[]>(resolvedCompanyId ?? "pending"),
+  });
+
+  const { data: allIssues } = useQuery({
+    queryKey: queryKeys.issues.list(selectedCompanyId!),
+    queryFn: () => issuesApi.list(selectedCompanyId!, { limit: 200 }),
+    enabled: !!selectedCompanyId,
   });
 
   const { data: agents } = useQuery({
@@ -1859,6 +1872,25 @@ export function IssueDetail() {
     },
   });
 
+  const jitTargetsQuery = useQuery({
+    queryKey: ["jit-targets"],
+    queryFn: () => issuesApi.listJitTargets(),
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const requestJitSshToken = useMutation({
+    mutationFn: (opts: { target: string; principal?: string; ttlMinutes?: number }) =>
+      issuesApi.requestJitSshToken(issueId!, opts),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(issueId!) });
+      pushToast({ title: "SSH token provisioned", body: "A JIT SSH credential has been attached to this issue." });
+      setJitDialogOpen(false);
+    },
+    onError: (err: Error & { status?: number; body?: { error?: string } }) => {
+      pushToast({ title: "SSH token failed", body: err.body?.error ?? err.message, tone: "error" });
+    },
+  });
+
   const addCommentAndReassign = useMutation({
     mutationFn: ({
       body,
@@ -2307,6 +2339,7 @@ export function IssueDetail() {
         childIssues={panelChildIssues}
         onAddSubIssue={openNewSubIssue}
         onUpdate={handleIssuePropertiesUpdate}
+        onOpenJitDialog={() => setJitDialogOpen(true)}
       />
     );
     return () => closePanel();
@@ -2970,24 +3003,24 @@ export function IssueDetail() {
           )}
 
           {!(isMobile && isFromInbox) && (
-            <div className="ml-auto flex items-center gap-0.5 md:hidden shrink-0">
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                onClick={copyIssueToClipboard}
-                title="Copy issue as markdown"
-              >
-                {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                onClick={() => setMobilePropsOpen(true)}
-                title="Properties"
-              >
-                <SlidersHorizontal className="h-4 w-4" />
-              </Button>
-            </div>
+            <IssueHeaderActions
+              copied={copied}
+              panelVisible={panelVisible}
+              moreOpen={moreOpen}
+              onMoreOpenChange={setMoreOpen}
+              mobileActionsOpen={mobileActionsOpen}
+              onMobileActionsOpenChange={setMobileActionsOpen}
+              onCopy={copyIssueToClipboard}
+              onShowProperties={() => setMobilePropsOpen(true)}
+              onShowPanel={() => setPanelVisible(true)}
+              onOpenJitDialog={() => setJitDialogOpen(true)}
+              onHideIssue={() => {
+                updateIssue.mutate(
+                  { hiddenAt: new Date().toISOString() },
+                  { onSuccess: () => navigate("/issues/all") },
+                );
+              }}
+            />
           )}
 
           <div className="hidden md:flex items-center md:ml-auto shrink-0">
@@ -3117,6 +3150,109 @@ export function IssueDetail() {
               </button>
             </PopoverContent>
             </Popover>
+
+            {/* ── JIT SSH Token Request Dialog ────────────────── */}
+            <Dialog open={jitDialogOpen} onOpenChange={(open) => {
+              setJitDialogOpen(open);
+              if (!open) requestJitSshToken.reset();
+            }}>
+              <DialogContent className="sm:max-w-md">
+                <DialogHeader>
+                  <DialogTitle>Request JIT SSH Access</DialogTitle>
+                  <DialogDescription>
+                    Provision a short-lived SSH certificate for this issue&rsquo;s agent.
+                  </DialogDescription>
+                </DialogHeader>
+
+                <form
+                  className="grid gap-4 py-2"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const opts: { target: string; principal?: string; ttlMinutes?: number } = {
+                      target: jitTarget,
+                    };
+                    if (jitPrincipal) opts.principal = jitPrincipal;
+                    const ttlNum = parseInt(jitTtl, 10);
+                    if (jitTtl && !isNaN(ttlNum) && ttlNum > 0) opts.ttlMinutes = ttlNum;
+                    requestJitSshToken.mutate(opts);
+                  }}
+                >
+                  {/* Target machine */}
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="jit-target">Target machine</Label>
+                    <Select value={jitTarget} onValueChange={setJitTarget}>
+                      <SelectTrigger id="jit-target">
+                        <SelectValue placeholder="Select machine" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {(jitTargetsQuery.data ?? []).map((t) => (
+                          <SelectItem key={t.name} value={t.name}>
+                            {t.label} ({t.name})
+                          </SelectItem>
+                        ))}
+                        {!jitTargetsQuery.data?.length && (
+                          <SelectItem value="work.int" disabled>
+                            Loading…
+                          </SelectItem>
+                        )}
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  {/* Principal / permission */}
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="jit-principal">Permission level</Label>
+                    <Select value={jitPrincipal} onValueChange={setJitPrincipal}>
+                      <SelectTrigger id="jit-principal">
+                        <SelectValue placeholder={`Default (${
+                          jitTargetsQuery.data?.find((t) => t.name === jitTarget)?.defaultPrincipal ?? "agent"
+                        })`} />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="agent-read">agent-read</SelectItem>
+                        <SelectItem value="agent-web">agent-web</SelectItem>
+                        <SelectItem value="agent-admin">agent-admin</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  {/* TTL */}
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="jit-ttl">TTL (minutes)</Label>
+                    <Input
+                      id="jit-ttl"
+                      type="number"
+                      min={1}
+                      max={1440}
+                      placeholder={String(
+                        jitTargetsQuery.data?.find((t) => t.name === jitTarget)?.defaultTtlMinutes ?? 60
+                      )}
+                      value={jitTtl}
+                      onChange={(e) => setJitTtl(e.target.value)}
+                    />
+                  </div>
+
+                  {/* Error display */}
+                  {requestJitSshToken.isError && (
+                    <p className="text-sm text-destructive">
+                      {(requestJitSshToken.error as Error & { body?: { error?: string } }).body?.error ??
+                        requestJitSshToken.error.message}
+                    </p>
+                  )}
+
+                  <DialogFooter>
+                    <Button
+                      type="submit"
+                      disabled={requestJitSshToken.isPending}
+                      className="gap-2"
+                    >
+                      {requestJitSshToken.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+                      {requestJitSshToken.isPending ? "Provisioning…" : "Provision Token"}
+                    </Button>
+                  </DialogFooter>
+                </form>
+              </DialogContent>
+            </Dialog>
           </div>
         </div>
 
@@ -3666,6 +3802,7 @@ export function IssueDetail() {
                 onAddSubIssue={openNewSubIssue}
                 onUpdate={(data) => updateIssue.mutate(data)}
                 inline
+                onOpenJitDialog={() => { setMobilePropsOpen(false); setJitDialogOpen(true); }}
               />
             </div>
           </ScrollArea>

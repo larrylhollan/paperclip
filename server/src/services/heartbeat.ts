@@ -151,6 +151,7 @@ const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
+const GHOST_CLAIM_STALE_MS = 5 * 60 * 1000;
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
@@ -3292,6 +3293,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
     now: Date,
+    retryReason = "process_lost",
   ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
@@ -3301,7 +3303,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ...contextSnapshot,
       retryOfRunId: run.id,
       wakeReason: "process_lost_retry",
-      retryReason: "process_lost",
+      retryReason,
     };
 
     const queued = await db.transaction(async (tx) => {
@@ -3770,8 +3772,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const context = parseObject(run.contextSnapshot);
+
+    // Fix for #3168: cancel queued runs whose issue is already done/cancelled
+    const runIssueId = readNonEmptyString(context.issueId);
+    if (runIssueId) {
+      const [issueRow] = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, runIssueId))
+        .limit(1);
+      if (issueRow && (issueRow.status === "done" || issueRow.status === "cancelled")) {
+        await cancelRunInternal(
+          run.id,
+          `Cancelled because the associated issue is ${issueRow.status}`,
+        );
+        return null;
+      }
+    }
+
     const budgetBlock = await budgets.getInvocationBlock(run.companyId, run.agentId, {
-      issueId: readNonEmptyString(context.issueId),
+      issueId: runIssueId,
       projectId: readNonEmptyString(context.projectId),
     });
     if (budgetBlock) {
@@ -4384,10 +4404,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
+      // Ghost claims: adapter claimed the run (status=running) but never started
+      // execution — no PID, no processStartedAt. These block the agent's
+      // maxConcurrentRuns slots and cannot recover on their own.
+      const isGhostClaim = !run.processPid && !run.processStartedAt;
+
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
-        if (now.getTime() - refTime < staleThresholdMs) continue;
+        const elapsed = now.getTime() - refTime;
+        const effectiveThreshold = isGhostClaim
+          ? Math.min(staleThresholdMs, GHOST_CLAIM_STALE_MS)
+          : staleThresholdMs;
+        if (elapsed < effectiveThreshold) continue;
       }
 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
@@ -4424,12 +4453,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
-      const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      // Retry ghost claims (adapter connection failure) and local child process losses
+      const shouldRetry =
+        (isGhostClaim || (tracksLocalChild && (!!run.processPid || !!run.processGroupId))) &&
+        (run.processLossRetryCount ?? 0) < 3;
+      const baseMessage = isGhostClaim
+        ? "Ghost claim -- adapter never started execution (no PID, no processStartedAt)"
+        : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      const errorCode = isGhostClaim ? "ghost_run_stale_claim" : "process_lost";
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-        errorCode: "process_lost",
+        error: shouldRetry ? `${baseMessage}; retrying (attempt ${(run.processLossRetryCount ?? 0) + 1}/3)` : baseMessage,
+        errorCode,
         finishedAt: now,
         resultJson: mergeRunStopMetadataForAgent(
           { adapterType, adapterConfig },
@@ -4443,7 +4478,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+        error: shouldRetry ? `${baseMessage}; retrying (attempt ${(run.processLossRetryCount ?? 0) + 1}/3)` : baseMessage,
       });
       if (!finalizedRun) finalizedRun = await getRun(run.id);
       if (!finalizedRun) continue;
@@ -4453,7 +4488,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (shouldRetry) {
         const agent = await getAgent(run.agentId);
         if (agent) {
-          retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, now);
+          retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, now, isGhostClaim ? "ghost_run_stale_claim" : "process_lost");
         }
       } else {
         await releaseIssueExecutionAndPromote(finalizedRun);
@@ -4471,6 +4506,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
           ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
+          ...(isGhostClaim ? { ghostClaim: true } : {}),
         },
       });
 
@@ -4487,12 +4523,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function resumeQueuedRuns() {
-    const queuedRuns = await db
+    // Pre-cancel queued runs whose issue is already done/cancelled
+    const allQueued = await db
+      .select({
+        id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"));
+
+    for (const run of allQueued) {
+      const ctx = parseObject(run.contextSnapshot);
+      const issueId = readNonEmptyString(ctx.issueId);
+      if (!issueId) continue;
+      const [issueRow] = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .limit(1);
+      if (issueRow && (issueRow.status === "done" || issueRow.status === "cancelled")) {
+        await cancelRunInternal(run.id, `Cancelled because the associated issue is ${issueRow.status}`);
+        // Clear executionRunId on the issue
+        await db
+          .update(issues)
+          .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null, updatedAt: new Date() })
+          .where(eq(issues.executionRunId, run.id));
+      }
+    }
+
+    // Now resume legitimate queued runs
+    const remainingQueued = await db
       .select({ agentId: heartbeatRuns.agentId })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.status, "queued"));
 
-    const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
+    const agentIds = [...new Set(remainingQueued.map((r) => r.agentId))];
     for (const agentId of agentIds) {
       await startNextQueuedRunForAgent(agentId);
     }
@@ -4603,13 +4669,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function startNextQueuedRunForAgent(agentId: string) {
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
-      if (!agent) return [];
+      if (!agent) { logger.warn({ agentId }, "[queue-debug] agent not found"); return []; }
       if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
+        logger.warn({ agentId, agentStatus: agent.status }, "[queue-debug] agent not invokable");
         return [];
       }
       const policy = parseHeartbeatPolicy(agent);
       const runningCount = await countRunningRunsForAgent(agentId);
       const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
+      logger.info({ agentId, agentName: agent.name, maxConcurrentRuns: policy.maxConcurrentRuns, runningCount, availableSlots }, "[queue-debug] slot check");
       if (availableSlots <= 0) return [];
 
       const queuedRuns = await db
@@ -4674,6 +4742,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function executeRun(runId: string) {
+    logger.info({ runId }, "[queue-debug] executeRun called");
     let run = await getRun(runId);
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
@@ -5509,6 +5578,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+      logger.info({ runId: run.id, agentName: agent.name, adapterType: agent.adapterType }, "[queue-debug] calling adapter.execute");
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,
@@ -6516,6 +6586,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
           .then((rows) => rows[0] ?? null);
+
+        // Skip wakeup for done/cancelled issues — prevents ghost queued runs
+        if (issue && (issue.status === "done" || issue.status === "cancelled")) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "issue_already_closed",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          return { kind: "skipped" as const };
+        }
 
         if (!issue) {
           await tx.insert(agentWakeupRequests).values({
@@ -7563,6 +7651,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     cancelRun: (runId: string) => cancelRunInternal(runId),
+
+    cancelRunsForIssue: async (issueId: string, reason?: string, excludeRunId?: string) => {
+      // Fix for #3168: cancel all queued/running runs associated with a closed issue
+      // excludeRunId: skip the run that is completing the issue (prevents self-cancel)
+      const staleRuns = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            inArray(heartbeatRuns.status, ["queued", "running"]),
+            sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+          ),
+        );
+      const filtered = excludeRunId ? staleRuns.filter((r) => r.id !== excludeRunId) : staleRuns;
+      for (const run of filtered) {
+        await cancelRunInternal(run.id, reason ?? "Cancelled because the associated issue was closed");
+        // Clear executionRunId on the issue so it doesn't appear as a stuck ghost run
+        await db
+          .update(issues)
+          .set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: new Date(),
+          })
+          .where(and(eq(issues.executionRunId, run.id)));
+      }
+      return filtered.length;
+    },
 
     cancelActiveForAgent: (agentId: string) => cancelActiveForAgentInternal(agentId),
 

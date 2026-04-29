@@ -874,6 +874,12 @@ export {
   type PluginStateScopeKey,
   type SetPluginState,
   type ListPluginState,
+  createJitPreApprovalSchema,
+  updateJitPreApprovalStatusSchema,
+  exchangeJitPreApprovalSchema,
+  type CreateJitPreApproval,
+  type UpdateJitPreApprovalStatus,
+  type ExchangeJitPreApproval,
 } from "./validators/index.js";
 
 export { API_PREFIX, API } from "./api.js";

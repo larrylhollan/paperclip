@@ -520,6 +520,14 @@ export async function startServer(): Promise<StartedServer> {
     authReady = true;
   }
 
+  if (process.env.JIT_TELEGRAM_BOT_TOKEN && !process.env.JIT_APPROVAL_HMAC_SECRET) {
+    logger.warn(
+      "JIT_TELEGRAM_BOT_TOKEN is set but JIT_APPROVAL_HMAC_SECRET is not — " +
+      "quick-action approval URLs will not work. " +
+      "Set JIT_APPROVAL_HMAC_SECRET to a dedicated secret (do NOT reuse BETTER_AUTH_SECRET)."
+    );
+  }
+
   if (resolvedEmbeddedPostgresPort !== null && resolvedEmbeddedPostgresPort !== config.embeddedPostgresPort) {
     config.embeddedPostgresPort = resolvedEmbeddedPostgresPort;
   }
@@ -737,8 +745,8 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "routine scheduler tick failed");
         });
   
-      // Periodically reap orphaned runs (5-min staleness threshold) and make sure
-      // persisted queued work is still being driven forward.
+      // Periodically reap orphaned runs (configurable staleness threshold, default 25min)
+      // and make sure persisted queued work is still being driven forward.
       void heartbeat
         .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
         .then(() => heartbeat.promoteDueScheduledRetries())

@@ -526,6 +526,27 @@
       "when": 1777384535070,
       "tag": "0074_striped_genesis",
       "breakpoints": true
+    },
+    {
+      "idx": 75,
+      "version": "7",
+      "when": 1777400000000,
+      "tag": "0075_jit_issuances",
+      "breakpoints": true
+    },
+    {
+      "idx": 76,
+      "version": "7",
+      "when": 1777400100000,
+      "tag": "0076_jit_pre_approvals",
+      "breakpoints": true
+    },
+    {
+      "idx": 77,
+      "version": "7",
+      "when": 1777400200000,
+      "tag": "0077_jit_pre_approval_telegram_ids",
+      "breakpoints": true
     }
   ]
 }

@@ -237,4 +237,45 @@ export const issuesApi = {
   updateWorkProduct: (id: string, data: Record<string, unknown>) =>
     api.patch<IssueWorkProduct>(`/work-products/${id}`, data),
   deleteWorkProduct: (id: string) => api.delete<IssueWorkProduct>(`/work-products/${id}`),
+  listJitTargets: () =>
+    api.get<{ name: string; label: string; defaultPrincipal: string; defaultTtlMinutes: number }[]>("/jit-targets"),
+  requestJitSshToken: (
+    id: string,
+    opts: {
+      target: string;
+      principal?: string;
+      ttlMinutes?: number;
+      options?: Record<string, unknown>;
+    },
+  ) =>
+    api.post<{
+      comment: IssueComment;
+      token: {
+        type: "jit-ssh-token";
+        schema_version?: number;
+        target: string;
+        target_label?: string;
+        fetch_url: string;
+        principal?: string;
+        ttl_minutes?: number;
+        ssh_host?: string;
+        ssh_user?: string;
+        cert_id?: string;
+        issued_at?: string;
+        expires_at?: string;
+        issued_options?: Record<string, unknown>;
+        // Legacy aliases retained for older consumers.
+        fetchUrl?: string;
+        ttlMinutes?: number;
+        targetHost?: string;
+        sshHost?: string;
+        sshUser?: string;
+        certId?: string;
+        issuedAt?: string;
+        expiresAt?: string;
+        issuedOptions?: Record<string, unknown>;
+      };
+    }>(`/issues/${id}/jit-ssh-token`, opts),
+  resolveIssuance: (issuanceId: string) =>
+    api.post<Record<string, unknown>>(`/issuances/${issuanceId}/resolve`, {}),
 };

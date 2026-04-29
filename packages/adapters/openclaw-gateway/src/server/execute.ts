@@ -12,6 +12,7 @@ import {
   stringifyPaperclipWakePayload,
 } from "@paperclipai/adapter-utils/server-utils";
 import crypto, { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { WebSocket } from "ws";
 
 type SessionKeyStrategy = "fixed" | "issue" | "run";
@@ -24,10 +25,17 @@ type WakePayload = {
   issueId: string | null;
   wakeReason: string | null;
   wakeCommentId: string | null;
+  wakeCommentBody: string | null;
   approvalId: string | null;
   approvalStatus: string | null;
   issueIds: string[];
 };
+
+interface ParentIssueContext {
+  identifier: string;
+  title: string;
+  description: string;
+}
 
 type GatewayDeviceIdentity = {
   deviceId: string;
@@ -133,9 +141,8 @@ function normalizeSessionKeyStrategy(value: unknown): SessionKeyStrategy {
   return "issue";
 }
 
-function prefixSessionKeyForAgent(sessionKey: string, agentId: string | null): string {
-  if (!agentId || sessionKey.startsWith("agent:")) return sessionKey;
-  return `agent:${agentId}:${sessionKey}`;
+function hasAgentScope(sessionKey: string): boolean {
+  return /^agent:[a-z0-9_-]+:.+/.test(sessionKey.trim());
 }
 
 export function resolveSessionKey(input: {
@@ -146,13 +153,17 @@ export function resolveSessionKey(input: {
   issueId: string | null;
 }): string {
   const fallback = input.configuredSessionKey ?? "paperclip";
+  let base: string;
   if (input.strategy === "run") {
-    return prefixSessionKeyForAgent(`paperclip:run:${input.runId}`, input.agentId);
+    base = `paperclip:run:${input.runId}`;
+  } else if (input.strategy === "issue" && input.issueId) {
+    base = `paperclip:issue:${input.issueId}`;
+  } else {
+    base = fallback;
   }
-  if (input.strategy === "issue" && input.issueId) {
-    return prefixSessionKeyForAgent(`paperclip:issue:${input.issueId}`, input.agentId);
-  }
-  return prefixSessionKeyForAgent(fallback, input.agentId);
+  if (!input.agentId || input.agentId === "main") return base;
+  if (hasAgentScope(base)) return base;
+  return `agent:${input.agentId}:${base}`;
 }
 
 function isLoopbackHost(hostname: string): boolean {
@@ -308,6 +319,7 @@ function buildWakePayload(ctx: AdapterExecutionContext): WakePayload {
     issueId: nonEmpty(context.issueId),
     wakeReason: nonEmpty(context.wakeReason),
     wakeCommentId: nonEmpty(context.wakeCommentId) ?? nonEmpty(context.commentId),
+    wakeCommentBody: nonEmpty(context.wakeCommentBody),
     approvalId: nonEmpty(context.approvalId),
     approvalStatus: nonEmpty(context.approvalStatus),
     issueIds: Array.isArray(context.issueIds)
@@ -362,13 +374,32 @@ function buildWakeText(
   payload: WakePayload,
   paperclipEnv: Record<string, string>,
   structuredWakePrompt: string,
+  claimedApiKeyPathOverride?: string | null,
+  parentContext?: ParentIssueContext | null,
 ): string {
-  const claimedApiKeyPath = "~/.openclaw/workspace/paperclip-claimed-api-key.json";
+  const claimedApiKeyPath =
+    nonEmpty(claimedApiKeyPathOverride) ?? "~/.openclaw/workspace/paperclip-claimed-api-key.json";
+
+  // Try to read the actual token from the claimed key file so agents don't have to.
+  let resolvedApiKey: string | null = null;
+  try {
+    const expandedPath = claimedApiKeyPath.replace(/^~/, process.env.HOME ?? "~");
+    const raw = readFileSync(expandedPath, "utf-8");
+    const parsed = JSON.parse(raw);
+    const token = parsed.token ?? parsed.apiKey ?? parsed.key;
+    if (typeof token === "string" && token.length > 0) {
+      resolvedApiKey = token;
+    }
+  } catch {
+    // File not found or unreadable — fall back to telling the agent to read it.
+  }
+
   const orderedKeys = [
     "PAPERCLIP_RUN_ID",
     "PAPERCLIP_AGENT_ID",
     "PAPERCLIP_COMPANY_ID",
     "PAPERCLIP_API_URL",
+    "PAPERCLIP_API_KEY",
     "PAPERCLIP_TASK_ID",
     "PAPERCLIP_WAKE_REASON",
     "PAPERCLIP_WAKE_COMMENT_ID",
@@ -384,6 +415,15 @@ function buildWakeText(
     envLines.push(`${key}=${value}`);
   }
 
+  // Fall back to reading claimed key file if PAPERCLIP_API_KEY was not already in paperclipEnv
+  const hasApiKeyInEnv = Boolean(paperclipEnv.PAPERCLIP_API_KEY);
+  if (!hasApiKeyInEnv && resolvedApiKey) {
+    envLines.push(`PAPERCLIP_API_KEY=${resolvedApiKey}`);
+  }
+  if (!hasApiKeyInEnv && !resolvedApiKey) {
+    envLines.push(`PAPERCLIP_API_KEY=<token from ${claimedApiKeyPath}>`);
+  }
+
   const issueIdHint = payload.taskId ?? payload.issueId ?? "";
   const apiBaseHint = paperclipEnv.PAPERCLIP_API_URL ?? "<set PAPERCLIP_API_URL>";
 
@@ -394,18 +434,41 @@ function buildWakeText(
     "",
     "Set these values in your run context:",
     ...envLines,
-    `PAPERCLIP_API_KEY=<token from ${claimedApiKeyPath}>`,
-    "",
-    `Load PAPERCLIP_API_KEY from ${claimedApiKeyPath} (the token you saved after claim-api-key).`,
+    ...(!hasApiKeyInEnv && !resolvedApiKey
+      ? [
+          "",
+          `Load PAPERCLIP_API_KEY from ${claimedApiKeyPath} (the token you saved after claim-api-key).`,
+        ]
+      : []),
     "",
     `api_base=${apiBaseHint}`,
     `task_id=${payload.taskId ?? ""}`,
     `issue_id=${payload.issueId ?? ""}`,
     `wake_reason=${payload.wakeReason ?? ""}`,
     `wake_comment_id=${payload.wakeCommentId ?? ""}`,
+    ...(payload.wakeCommentBody
+      ? [
+          "",
+          "=== WAKE COMMENT (the reason this issue was reopened) ===",
+          payload.wakeCommentBody,
+          "=== END WAKE COMMENT ===",
+          "",
+        ]
+      : []),
     `approval_id=${payload.approvalId ?? ""}`,
     `approval_status=${payload.approvalStatus ?? ""}`,
     `linked_issue_ids=${payload.issueIds.join(",")}`,
+    ...(parentContext
+      ? [
+          "",
+          `=== PARENT ISSUE CONTEXT (${parentContext.identifier}: ${parentContext.title}) ===`,
+          parentContext.description.length > 4000
+            ? `${parentContext.description.slice(0, 4000)}\n\n[truncated — full description available via GET /api/issues/{parentId}]`
+            : parentContext.description,
+          "=== END PARENT ISSUE CONTEXT ===",
+          "",
+        ]
+      : []),
     "",
     "HTTP rules:",
     "- Use Authorization: Bearer $PAPERCLIP_API_KEY on every API call.",
@@ -1107,20 +1170,96 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload);
   const structuredWakePrompt = renderPaperclipWakePrompt(ctx.context.paperclipWake);
   const structuredWakeJson = stringifyPaperclipWakePayload(ctx.context.paperclipWake);
+  const claimedApiKeyPath = nonEmpty(ctx.config.claimedApiKeyPath);
+
+  // --- Fetch parent issue context (non-fatal) ---
+  let parentContext: ParentIssueContext | null = null;
+  const apiUrl = paperclipEnv.PAPERCLIP_API_URL;
+  let resolvedApiKey: string | null = null;
+  try {
+    const keyPath = claimedApiKeyPath ?? "~/.openclaw/workspace/paperclip-claimed-api-key.json";
+    const expandedPath = keyPath.replace(/^~/, process.env.HOME ?? "~");
+    const raw = readFileSync(expandedPath, "utf-8");
+    const parsed = JSON.parse(raw);
+    const token = parsed.token ?? parsed.apiKey ?? parsed.key;
+    if (typeof token === "string" && token.length > 0) {
+      resolvedApiKey = token;
+    }
+  } catch {
+    // Key file not readable — parent context fetch will be skipped.
+  }
+
+  // Inject PAPERCLIP_API_KEY into env so child agents (e.g. jit_connect.py) can use it
+  if (resolvedApiKey) {
+    paperclipEnv.PAPERCLIP_API_KEY = resolvedApiKey;
+  }
+
+  if (wakePayload.issueId && apiUrl && resolvedApiKey) {
+    const jsonHeaders = {
+      Authorization: `Bearer ${resolvedApiKey}`,
+      Accept: "application/json",
+    };
+    try {
+      const issueRes = await fetch(`${apiUrl}/api/issues/${wakePayload.issueId}`, {
+        headers: jsonHeaders,
+      });
+      if (issueRes.ok) {
+        const contentType = issueRes.headers.get("content-type") ?? "";
+        if (!contentType.includes("json")) {
+          await ctx.onLog("stderr", `[openclaw-gateway] warn: issue fetch returned non-JSON content-type: ${contentType}\n`);
+        } else {
+          const issueData = await issueRes.json();
+          const issue = Array.isArray(issueData) ? issueData[0] : issueData;
+          const parentId = issue?.parentId;
+          if (parentId) {
+            const parentRes = await fetch(`${apiUrl}/api/issues/${parentId}`, {
+              headers: jsonHeaders,
+            });
+            if (parentRes.ok) {
+              const parentContentType = parentRes.headers.get("content-type") ?? "";
+              if (!parentContentType.includes("json")) {
+                await ctx.onLog("stderr", `[openclaw-gateway] warn: parent issue fetch returned non-JSON content-type: ${parentContentType}\n`);
+              } else {
+                const parentData = await parentRes.json();
+                const parent = Array.isArray(parentData) ? parentData[0] : parentData;
+                if (parent?.identifier && parent?.title) {
+                  parentContext = {
+                    identifier: parent.identifier,
+                    title: parent.title,
+                    description: parent.description ?? "",
+                  };
+                }
+              }
+            } else {
+              await ctx.onLog("stderr", `[openclaw-gateway] warn: failed to fetch parent issue ${parentId}: ${parentRes.status}\n`);
+            }
+          }
+        }
+      } else {
+        await ctx.onLog("stderr", `[openclaw-gateway] warn: failed to fetch issue ${wakePayload.issueId}: ${issueRes.status}\n`);
+      }
+    } catch (err) {
+      await ctx.onLog("stderr", `[openclaw-gateway] warn: parent context fetch failed: ${err}\n`);
+    }
+  }
+
   const wakeText = buildWakeText(
     wakePayload,
     paperclipEnv,
     structuredWakeJson
       ? joinWakePayloadSections(structuredWakePrompt, structuredWakeJson)
       : structuredWakePrompt,
+    claimedApiKeyPath,
+    parentContext,
   );
 
   const sessionKeyStrategy = normalizeSessionKeyStrategy(ctx.config.sessionKeyStrategy);
   const configuredSessionKey = nonEmpty(ctx.config.sessionKey);
+  const configuredAgentId = nonEmpty(ctx.config.agentId);
   const sessionKey = resolveSessionKey({
     strategy: sessionKeyStrategy,
     configuredSessionKey,
-    agentId: nonEmpty(ctx.config.agentId),
+    agentId: configuredAgentId ?? nonEmpty(wakePayload.agentId),
     runId: ctx.runId,
     issueId: wakePayload.issueId,
   });
@@ -1136,9 +1275,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     idempotencyKey: ctx.runId,
   };
   delete agentParams.text;
-  agentParams.paperclip = paperclipPayload;
+  // agentParams.paperclip = paperclipPayload; // PATCHED: OpenClaw rejects unknown root properties
 
-  const configuredAgentId = nonEmpty(ctx.config.agentId);
   if (configuredAgentId && !nonEmpty(agentParams.agentId)) {
     agentParams.agentId = configuredAgentId;
   }
